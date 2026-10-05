@@ -1,6 +1,8 @@
 # Dashboard
 
-Terminal dashboard engine (Node.js + `blessed`), shared as a git submodule by every project that uses it. The engine lives here, each host project keeps its own `dashboard.json` beside its scripts.
+[![Build](https://github.com/Jango73/dashboard/actions/workflows/build.yml/badge.svg)](https://github.com/Jango73/dashboard/actions/workflows/build.yml)
+
+Terminal dashboard engine (Node.js + `blessed`). The engine lives here, each host project keeps its own `dashboard.json` beside its scripts.
 
 ## Mounting
 
