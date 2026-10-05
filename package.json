@@ -1,0 +1,12 @@
+{
+  "name": "dashboard",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Terminal dashboard engine (blessed) shared as a git submodule; each host project keeps its own dashboard.json",
+  "type": "module",
+  "dependencies": {
+    "blessed": "^0.1.81",
+    "kill-port": "^2.0.1",
+    "tail": "^2.2.6"
+  }
+}
