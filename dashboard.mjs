@@ -482,7 +482,9 @@ function switchCommandSet(direction = 1) {
     screen.render();
 }
 
-let sidebarEntries = normalizeSidebarEntriesFromSet(getCurrentCommandSet());
+let sidebarEntries = (Array.isArray(config.commandSets) && config.commandSets.length > 0)
+    ? normalizeSidebarEntriesFromSet(getCurrentCommandSet())
+    : normalizeSidebarEntries();
 let scripts = loadScripts(sidebarEntries);
 
 const dashboardTheme = {
