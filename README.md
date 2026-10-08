@@ -27,10 +27,10 @@ Keep a thin `./dashboard.sh` shim at the project root when existing shortcuts or
     "scriptsDir": "scripts",
     "commandSets": [
         { "name": "<set name>", "commands": [
-            { "label": "<display label>", "script": "<script file>", "key": "<optional key>", "promptCwd": false, "danger": false, "disabled": false }
+            { "label": "<display label>", "script": "<script file>", "key": "<optional key>", "promptCwd": false, "danger": false, "disabled": false, "description": "<optional footer text>" }
         ] }
     ],
-    "settings": { "enableCommandHistory": true, "persistLogs": false, "notifyOnExit": true, "showCustomCommand": true, "showLogWindow": false, "renderThrottleMs": 100, "maxLogLines": 1000, "sidebarMinWidth": 32 },
+    "settings": { "enableCommandHistory": true, "persistLogs": false, "logDir": "log", "notifyOnExit": true, "showCustomCommand": true, "showLogWindow": false, "renderThrottleMs": 100, "maxLogLines": 1000, "sidebarMinWidth": 32 },
     "events": {
         "onDashboardStart": [],
         "beforeStartProcess": [
@@ -42,4 +42,4 @@ Keep a thin `./dashboard.sh` shim at the project root when existing shortcuts or
 }
 ```
 
-Legacy top-level `commands` (plain list) and `keyBindings` entries stay accepted. Per-command flags: `promptCwd` (aliases `cwdPrompt`, `askCwd`, `cwdRequired`) opens a folder selector before launch, `danger` renders the entry on a red background, `disabled` hides the entry from the sidebar, `key` binds a shortcut written as whole words joined with `+` (`control+b`, `shift+a`, `alt+c`, `function+f1`, `escape`, `f5`). Separators use a label-only entry such as `{ "label": "--------" }`.
+Legacy top-level `commands` (plain list) and `keyBindings` entries stay accepted. Per-command flags: `promptCwd` (aliases `cwdPrompt`, `askCwd`, `cwdRequired`) opens a folder selector before launch, `danger` renders the entry on a red background, `disabled` hides the entry from the sidebar, `description` shows a short text in the full-width footer while the entry is highlighted (empty when absent), `key` binds a shortcut written as whole words joined with `+` (`control+b`, `shift+a`, `alt+c`, `function+f1`, `escape`, `f5`). Separators use a label-only entry such as `{ "label": "--------" }`. `settings.logDir` sets the persisted-log directory relative to the working directory (`log` when absent), used only when `persistLogs` is true.

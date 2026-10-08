@@ -320,3 +320,13 @@ export function formatSidebarLabel(label, isDanger) {
     if (isDanger !== true) return label;
     return `${DANGER_LABEL_OPEN_TAG}${label}${DANGER_LABEL_CLOSE_TAG}`;
 }
+
+// --- Section 4: script descriptions ---
+// Sidebar entries accept an optional `"description"` string in
+// dashboard.json. The engine shows it in the full-width footer when the
+// entry is highlighted. Anything but a non-empty string means no text.
+export function resolveDescription(command) {
+    if (typeof command !== 'object' || command === null) return '';
+    if (typeof command.description !== 'string') return '';
+    return command.description.trim();
+}

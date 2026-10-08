@@ -7,6 +7,7 @@ import kill from 'kill-port';
 import {
     resolveCwdPromptFlag,
     resolveDangerFlag,
+    resolveDescription,
     formatSidebarLabel,
     withGnomeTerminalWorkdir,
     resolveSpawnCwd,
@@ -33,12 +34,12 @@ function spawnWithScriptsDirFallback(scriptsDir, scriptFile, spawnImpl) {
  *   "keyBindings": { "<key>": "<script file>", ... },
  *   "commands": [
  *     "<script file>",
- *     { "label": "<display label>", "script": "<script file>", "key": "<optional key>", "promptCwd": false },
+ *     { "label": "<display label>", "script": "<script file>", "key": "<optional key>", "promptCwd": false, "description": "<optional footer text>" },
  *     ...
  *   ],
  *   "commandSets": [
  *     { "name": "<set name>", "commands": [
- *       { "label": "<display label>", "script": "<script file>", "key": "<optional key>", "promptCwd": true },
+ *       { "label": "<display label>", "script": "<script file>", "key": "<optional key>", "promptCwd": true, "description": "<optional footer text>" },
  *       ...
  *     ] }
  *   ],
@@ -73,6 +74,12 @@ function spawnWithScriptsDirFallback(scriptsDir, scriptFile, spawnImpl) {
  *   the spawned process. Cancelling aborts the launch.
  * - Destructive entries render on a red background: set `danger: true`
  *   on a command entry.
+ * - Descriptive entries show a footer line when highlighted: set
+ *   `description: "<short text>"` on a command entry. Entries without
+ *   a description leave the footer empty.
+ * - The persisted-log directory reads `settings.logDir` (relative to
+ *   the working directory, `"log"` when absent): only used when
+ *   `persistLogs` is true.
  * - Hidden entries never reach the sidebar: set `disabled: true`
  *   on a command entry.
  * - Key shortcuts use whole words joined with "+": "control+b", "shift+a",
@@ -100,7 +107,8 @@ const defaultSettings = {
     maxLogLines: 1000,
     logBatchSize: 50,
     maxQueuedLogLines: 2000,
-    sidebarMinWidth: 32
+    sidebarMinWidth: 32,
+    logDir: 'log'
 };
 
 function parsePositiveInteger(value) {
@@ -136,6 +144,10 @@ function normalizeSettings(overrides) {
             }
             normalized[key] = parsed;
         }
+    }
+
+    if (typeof overrides.logDir === 'string' && overrides.logDir.trim() !== '') {
+        normalized.logDir = overrides.logDir.trim();
     }
 
     return normalized;
@@ -213,7 +225,8 @@ function enqueueLogLine(box, line) {
 
 function initLogFile() {
     if (config.settings?.persistLogs !== true || logStream) return;
-    const logDir = path.resolve(process.cwd(), 'log');
+    const configured = currentSettings.logDir ?? defaultSettings.logDir;
+    const logDir = path.resolve(process.cwd(), configured);
     if (!fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true });
     const timestamp = new Date().toISOString().replace(/[:]/g, '-');
     const filePath = path.join(logDir, `dash-${timestamp}.log`);
@@ -349,7 +362,8 @@ function normalizeSidebarEntries() {
             keyName,
             selectable: script !== '',
             promptCwd: resolveCwdPromptFlag(binding),
-            danger
+            danger,
+            description: resolveDescription(binding)
         });
     }
 
@@ -373,7 +387,8 @@ function normalizeSidebarEntries() {
             keyName,
             selectable: script !== '',
             promptCwd: resolveCwdPromptFlag(command),
-            danger
+            danger,
+            description: resolveDescription(command)
         });
     }
 
@@ -450,7 +465,8 @@ function normalizeSidebarEntriesFromSet(commandSet) {
             keyName,
             selectable: script !== '',
             promptCwd: resolveCwdPromptFlag(command),
-            danger
+            danger,
+            description: resolveDescription(command)
         });
     }
 
@@ -509,12 +525,13 @@ screen = blessed.screen({
 });
 
 const SIDEBAR_WIDTH_RATIO = 0.2;
+const DESCRIPTION_FOOTER_HEIGHT = 3;
 
 const sidebar = blessed.box({
     top: 0,
     left: 0,
     width: currentSettings.sidebarMinWidth ?? defaultSettings.sidebarMinWidth,
-    height: '100%',
+    height: '100%-3',
     label: 'Scripts',
     border: 'line',
     style: {
@@ -527,10 +544,23 @@ const rightContainer = blessed.box({
     top: 0,
     left: currentSettings.sidebarMinWidth ?? defaultSettings.sidebarMinWidth,
     width: '100%',
-    height: '100%',
+    height: '100%-3',
     style: {
         bg: dashboardTheme.panelAlt,
         fg: dashboardTheme.text
+    }
+});
+const descriptionFooter = blessed.box({
+    top: '100%-3',
+    left: 0,
+    width: '100%',
+    height: DESCRIPTION_FOOTER_HEIGHT,
+    label: ' Description ',
+    border: 'line',
+    style: {
+        bg: dashboardTheme.panel,
+        fg: dashboardTheme.text,
+        border: { fg: dashboardTheme.border }
     }
 });
 
@@ -764,6 +794,19 @@ list.key(['C-left'], () => {
 
 screen.append(sidebar);
 screen.append(rightContainer);
+screen.append(descriptionFooter);
+
+function updateDescriptionFooter(index) {
+    const entry = sidebarEntries[index ?? list.selected];
+    const text = entry && entry.selectable ? (entry.description ?? '') : '';
+    descriptionFooter.setContent(text);
+    scheduleRender();
+}
+
+list.on('select item', (_, index) => {
+    updateDescriptionFooter(index);
+});
+updateDescriptionFooter(list.selected ?? 0);
 
 function applyControlsLayout() {
     if (currentSettings.showCustomCommand === false) {
