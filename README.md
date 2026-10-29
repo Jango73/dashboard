@@ -2,7 +2,7 @@
 
 [![Build](https://github.com/Jango73/dashboard/actions/workflows/build.yml/badge.svg)](https://github.com/Jango73/dashboard/actions/workflows/build.yml)
 
-Terminal dashboard engine (Node.js + `blessed`). The engine lives here, each host project keeps its own `dashboard.json` beside its scripts.
+Terminal dashboard engine (Node.js + `OpenTUI`). The engine lives here, each host project keeps its own `dashboard.json` beside its scripts.
 
 ## Mounting
 
@@ -12,7 +12,7 @@ Add the submodule at `dashboard/` in the host project (or `backend/dashboard/` w
 git submodule add -b main git@github.com:Jango73/dashboard.git dashboard
 ```
 
-The host project must provide the runtime dependencies (`blessed`, `tail`, `kill-port`, see `package.json`) through its own `npm install`, and a `dashboard.json` in its working directory. Launch from the project root so the engine finds the project configuration:
+The host project must provide the runtime dependencies (`@opentui/core`, `tail`, `kill-port`, see `package.json`) through its own `npm install`, and a `dashboard.json` in its working directory. Launch from the project root so the engine finds the project configuration:
 
 ```sh
 ./dashboard/dashboard.sh
