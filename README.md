@@ -1,5 +1,7 @@
 # Dashboard
 
+![Dashboard preview](media/dashboard.jpg)
+
 [![Build](https://github.com/Jango73/dashboard/actions/workflows/build.yml/badge.svg)](https://github.com/Jango73/dashboard/actions/workflows/build.yml)
 
 Terminal dashboard engine (Node.js + `OpenTUI`). The engine lives here, each host project keeps its own `dashboard.json` beside its scripts.
