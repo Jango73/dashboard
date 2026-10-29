@@ -236,7 +236,9 @@ export function promptForWorkingDirectory(renderer, { mount, title = '', initial
                         flexGrow: 1,
                         options: [],
                         backgroundColor: theme.panel,
+                        focusedBackgroundColor: theme.panelFocus,
                         textColor: theme.text,
+                        focusedTextColor: theme.text,
                         selectedBackgroundColor: theme.selected,
                         selectedTextColor: theme.text,
                         showDescription: false

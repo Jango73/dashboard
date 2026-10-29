@@ -11,6 +11,7 @@ import {
     SelectRenderableEvents,
     InputRenderable,
     InputRenderableEvents,
+    RenderableEvents,
     ScrollBoxRenderable
 } from '@opentui/core';
 import {
@@ -457,14 +458,14 @@ function buildSelectOptions(entries) {
 }
 
 const dashboardTheme = {
-    background: '#1a2f4d',
-    panel: '#22436b',
-    panelAlt: '#1f3a5d',
-    text: '#e3edf9',
-    border: '#7ea2cd',
-    focus: '#c9ddf3',
-    selected: '#4f7fb2',
-    hover: '#3f6c9d'
+    background: '#212121',
+    panel: '#2e2e2e',
+    panelFocus: '#262626',
+    text: '#e8e8e8',
+    border: '#8a8a8a',
+    focus: '#d6d6d6',
+    selected: '#5a5a5a',
+    hover: '#4a4a4a'
 };
 
 function setOutputLabel(outputPanel, label) {
@@ -536,7 +537,9 @@ async function main() {
         minHeight: 0,
         options: buildSelectOptions(sidebarEntries),
         backgroundColor: dashboardTheme.panel,
+        focusedBackgroundColor: dashboardTheme.panelFocus,
         textColor: dashboardTheme.text,
+        focusedTextColor: dashboardTheme.text,
         selectedBackgroundColor: dashboardTheme.selected,
         selectedTextColor: dashboardTheme.text,
         showDescription: false
@@ -548,7 +551,7 @@ async function main() {
         flexBasis: 0,
         minWidth: 0,
         flexDirection: 'column',
-        backgroundColor: dashboardTheme.panelAlt
+        backgroundColor: dashboardTheme.panel
     });
     mainRow.add(rightCol);
 
@@ -558,7 +561,7 @@ async function main() {
         minHeight: 0,
         flexDirection: 'row',
         gap: 1,
-        backgroundColor: dashboardTheme.panelAlt
+        backgroundColor: dashboardTheme.panel
     });
     rightCol.add(logsRow);
 
@@ -568,7 +571,7 @@ async function main() {
         minHeight: 0,
         flexDirection: 'column',
         gap: 1,
-        backgroundColor: dashboardTheme.panelAlt
+        backgroundColor: dashboardTheme.panel
     });
     rightCol.add(bottomCol);
 
@@ -654,6 +657,20 @@ async function main() {
     outputPanel.add(outputScroll);
     const outputText = new TextRenderable(renderer, { content: '', fg: dashboardTheme.text });
     outputScroll.add(outputText);
+    outputScroll.on(RenderableEvents.FOCUSED, () => {
+        try {
+            outputPanel.backgroundColor = dashboardTheme.panelFocus;
+            outputScroll.backgroundColor = dashboardTheme.panelFocus;
+        } catch { /* ignore */ }
+        requestRenderNow();
+    });
+    outputScroll.on(RenderableEvents.BLURRED, () => {
+        try {
+            outputPanel.backgroundColor = dashboardTheme.panel;
+            outputScroll.backgroundColor = dashboardTheme.panel;
+        } catch { /* ignore */ }
+        requestRenderNow();
+    });
 
     const descPanel = new BoxRenderable(renderer, {
         height: 3,
@@ -812,6 +829,20 @@ async function main() {
         logPanel.add(scroll);
         const textNode = new TextRenderable(renderer, { content: '', fg: dashboardTheme.text });
         scroll.add(textNode);
+        scroll.on(RenderableEvents.FOCUSED, () => {
+            try {
+                logPanel.backgroundColor = dashboardTheme.panelFocus;
+                scroll.backgroundColor = dashboardTheme.panelFocus;
+            } catch { /* ignore */ }
+            requestRenderNow();
+        });
+        scroll.on(RenderableEvents.BLURRED, () => {
+            try {
+                logPanel.backgroundColor = dashboardTheme.panel;
+                scroll.backgroundColor = dashboardTheme.panel;
+            } catch { /* ignore */ }
+            requestRenderNow();
+        });
         logTexts.push(textNode);
         logScrolls.push(scroll);
         try {
