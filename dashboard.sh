@@ -17,7 +17,7 @@ else
     CONFIG_FILE="$ROOT_DIR/dashboard.json"
 fi
 
-MIN_NODE_MAJOR_VERSION=18
+MIN_NODE_MAJOR_VERSION=26
 NVM_NODE_VERSIONS_DIR="$HOME/.nvm/versions/node"
 
 fail() {
@@ -71,7 +71,7 @@ ensure_supported_node || fail "No node v$MIN_NODE_MAJOR_VERSION or newer found i
 [[ -f "$SCRIPT_FILE" ]] || fail "Missing script file: $SCRIPT_FILE"
 [[ -f "$CONFIG_FILE" ]] || fail "Missing config file: $CONFIG_FILE (copy and adapt dashboard.json first)"
 
-for dep in blessed tail kill-port; do
+for dep in "@opentui/core" tail kill-port; do
     node -e "import('$dep')" >/dev/null 2>&1 \
         || fail "Missing dependency '$dep'. Run: npm install"
 done
@@ -79,8 +79,9 @@ done
 printf '[dashboard] Starting dashboard...\n'
 # No exec: on a non-zero exit the terminal stays open (when interactive)
 # so a startup crash is visible instead of flashing and closing.
+# OpenTUI needs --experimental-ffi on Node.js to load its native backend.
 set +e
-node "$SCRIPT_FILE"
+node --experimental-ffi "$SCRIPT_FILE"
 NODE_EXIT_CODE=$?
 set -e
 if [[ "$NODE_EXIT_CODE" -ne 0 ]]; then

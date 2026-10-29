@@ -1,9 +1,18 @@
 import fs from 'fs';
 import path from 'path';
 import { spawn, exec } from 'child_process';
-import blessed from 'blessed';
 import { Tail } from 'tail';
 import kill from 'kill-port';
+import {
+    createCliRenderer,
+    BoxRenderable,
+    TextRenderable,
+    SelectRenderable,
+    SelectRenderableEvents,
+    InputRenderable,
+    InputRenderableEvents,
+    ScrollBoxRenderable
+} from '@opentui/core';
 import {
     resolveCwdPromptFlag,
     resolveDangerFlag,
@@ -13,19 +22,10 @@ import {
     resolveSpawnCwd,
     promptForWorkingDirectory,
     normalizeKeySpec,
+    specMatchesKeyEvent,
     formatKeyLabel
 } from './dashboard-ext.mjs';
 
-// Added: spawn fallback when script file is missing in scriptsDir
-function spawnWithScriptsDirFallback(scriptsDir, scriptFile, spawnImpl) {
-    const candidate = require('path').join(scriptsDir ?? './scripts', scriptFile);
-    const exists = require('fs').existsSync(candidate);
-    if (exists) {
-        return { cmd: candidate, usedFallback: false };
-    }
-    // Fallback: run the provided value as-is via shell
-    return { cmd: scriptFile, usedFallback: true };
-}
 /**
  * dashboard.json format:
  * {
@@ -72,7 +72,7 @@ function spawnWithScriptsDirFallback(scriptsDir, scriptFile, spawnImpl) {
  *   When the entry is activated (list selection or key shortcut), a folder
  *   selector modal opens first; the chosen directory is used as `cwd` for
  *   the spawned process. Cancelling aborts the launch.
- * - Destructive entries render on a red background: set `danger: true`
+ * - Destructive entries render with a "! " marker: set `danger: true`
  *   on a command entry.
  * - Descriptive entries show a footer line when highlighted: set
  *   `description: "<short text>"` on a command entry. Entries without
@@ -85,17 +85,9 @@ function spawnWithScriptsDirFallback(scriptsDir, scriptFile, spawnImpl) {
  * - Key shortcuts use whole words joined with "+": "control+b", "shift+a",
  *   "alt+c", "function+f1", "control+shift+s", "escape", "f5".
  *   Words accepted: control/ctrl, shift, alt/meta, function/fn (F-keys only).
- *   Raw blessed names ("C-b", "S-a", "M-c") still work. Invalid specs bind
+ *   Raw shorthand ("C-b", "S-a", "M-c") still works. Invalid specs bind
  *   nothing (the entry stays selectable from the list).
  */
-
-/*
-setTimeout(() => {
-    output.log('[dash] Timeout reached, exiting.');
-    screen.render();
-    process.exit(1);
-}, 60000);
-*/
 
 const defaultSettings = {
     enableCommandHistory: true,
@@ -155,11 +147,11 @@ function normalizeSettings(overrides) {
 
 let currentSettings = { ...defaultSettings };
 const logQueues = new Map();
-let screen = null;
+let renderer = null;
 
 let logStream = null;
 
-// interface LastCommand { kind: 'script' | 'custom'; value: string; }
+// interface LastCommand { kind: 'script' | 'custom'; value: string; cwd?: string }
 let lastCommand = null;
 
 // Throttle rendering to avoid performance issues with high-frequency log updates
@@ -170,47 +162,57 @@ function scheduleRender() {
     const delay = currentSettings.renderThrottleMs ?? defaultSettings.renderThrottleMs;
     setTimeout(() => {
         renderScheduled = false;
-        if (screen && typeof screen.render === 'function') {
-            screen.render();
+        if (renderer) {
+            try { renderer.requestRender(); } catch { /* ignore */ }
         }
     }, delay);
 }
 
-function ensureLogQueue(box) {
-    let entry = logQueues.get(box);
+function requestRenderNow() {
+    if (renderer) {
+        try { renderer.requestRender(); } catch { /* ignore */ }
+    }
+}
+
+function ensureLogQueue(textNode) {
+    let entry = logQueues.get(textNode);
     if (!entry) {
-        entry = { pending: [], processing: false, backlogDropped: false };
-        logQueues.set(box, entry);
+        entry = { pending: [], processing: false, backlogDropped: false, lines: [] };
+        logQueues.set(textNode, entry);
     }
     return entry;
 }
 
-function flushLogQueue(box) {
-    const entry = logQueues.get(box);
+function flushLogQueue(textNode) {
+    const entry = logQueues.get(textNode);
     if (!entry) return;
     const batchSize = currentSettings.logBatchSize ?? defaultSettings.logBatchSize;
     const batch = entry.pending.splice(0, batchSize);
     if (entry.backlogDropped) {
-        box.log('... [log backlog trimmed to keep dashboard responsive] ...');
+        entry.lines.push('... [log backlog trimmed to keep dashboard responsive] ...');
         entry.backlogDropped = false;
     }
     for (const line of batch) {
-        box.log(line);
+        entry.lines.push(line);
     }
     const maxLines = currentSettings.maxLogLines ?? defaultSettings.maxLogLines;
-    if (box.getLines().length > maxLines) {
-        box.setContent('... [log cleared to prevent memory overflow] ...\n');
+    if (entry.lines.length > maxLines) {
+        entry.lines = entry.lines.slice(entry.lines.length - maxLines);
+        entry.lines[0] = '... [log cleared to prevent memory overflow] ...';
     }
+    try {
+        textNode.content = entry.lines.join('\n');
+    } catch { /* ignore */ }
     scheduleRender();
     if (entry.pending.length > 0) {
-        setImmediate(() => flushLogQueue(box));
+        setImmediate(() => flushLogQueue(textNode));
     } else {
         entry.processing = false;
     }
 }
 
-function enqueueLogLine(box, line) {
-    const entry = ensureLogQueue(box);
+function enqueueLogLine(textNode, line) {
+    const entry = ensureLogQueue(textNode);
     entry.pending.push(line);
     const maxQueued = currentSettings.maxQueuedLogLines ?? defaultSettings.maxQueuedLogLines;
     if (entry.pending.length > maxQueued) {
@@ -219,7 +221,7 @@ function enqueueLogLine(box, line) {
     }
     if (!entry.processing) {
         entry.processing = true;
-        setImmediate(() => flushLogQueue(box));
+        setImmediate(() => flushLogQueue(textNode));
     }
 }
 
@@ -360,6 +362,7 @@ function normalizeSidebarEntries() {
             label: displayLabel !== '' ? displayLabel : rawKey,
             script,
             keyName,
+            rawKey,
             selectable: script !== '',
             promptCwd: resolveCwdPromptFlag(binding),
             danger,
@@ -385,6 +388,7 @@ function normalizeSidebarEntries() {
             label: displayLabel || fallbackLabel,
             script,
             keyName,
+            rawKey,
             selectable: script !== '',
             promptCwd: resolveCwdPromptFlag(command),
             danger,
@@ -393,40 +397,6 @@ function normalizeSidebarEntries() {
     }
 
     return entries;
-}
-
-function loadScripts(sidebarEntries) {
-    try {
-        return sidebarEntries.map((entry) => entry.text);
-    } catch {
-        return [];
-    }
-}
-
-function setOutputLabel(label) {
-    output.setLabel(` ${label} `);
-    screen.render(); // Keep immediate render for UI state changes
-}
-
-// interface LogWatcher { configPath: string; currentPath: string; box: blessed.Widgets.Log; tail: Tail; }
-function startTail(file, box) {
-    if (!fs.existsSync(file)) fs.writeFileSync(file, '');
-    const entry = ensureLogQueue(box);
-    entry.pending = [];
-    entry.processing = false;
-    entry.backlogDropped = false;
-    const tail = new Tail(file, {
-        follow: true,
-        useWatchFile: true,
-        fsWatchOptions: { interval: 500 }
-    });
-    tail.on('line', (line) => {
-        enqueueLogLine(box, line);
-    });
-    tail.on('error', (err) => {
-        enqueueLogLine(box, `Tail error: ${err.message}`);
-    });
-    return tail;
 }
 
 const config = loadConfig();
@@ -463,6 +433,7 @@ function normalizeSidebarEntriesFromSet(commandSet) {
             label: displayLabel || fallbackLabel,
             script,
             keyName,
+            rawKey,
             selectable: script !== '',
             promptCwd: resolveCwdPromptFlag(command),
             danger,
@@ -473,35 +444,17 @@ function normalizeSidebarEntriesFromSet(commandSet) {
     return entries;
 }
 
-function switchCommandSet(direction = 1) {
-    const sets = Array.isArray(config.commandSets) ? config.commandSets : [];
-    if (sets.length <= 1) return;
-
-    currentCommandSetIndex += direction;
-
-    if (currentCommandSetIndex < 0) {
-        currentCommandSetIndex = sets.length - 1;
-    } else if (currentCommandSetIndex >= sets.length) {
-        currentCommandSetIndex = 0;
-    }
-
-    const currentSet = getCurrentCommandSet();
-
-    sidebarEntries = normalizeSidebarEntriesFromSet(currentSet);
-    scripts = loadScripts(sidebarEntries);
-
-    list.setItems(scripts);
-    list.select(0);
-
-    sidebar.setLabel(` Scripts (${currentSet.name}) `);
-
-    screen.render();
-}
-
 let sidebarEntries = (Array.isArray(config.commandSets) && config.commandSets.length > 0)
     ? normalizeSidebarEntriesFromSet(getCurrentCommandSet())
     : normalizeSidebarEntries();
-let scripts = loadScripts(sidebarEntries);
+
+function buildSelectOptions(entries) {
+    return entries.map((entry, index) => ({
+        name: entry.text,
+        description: entry.selectable ? entry.label : '',
+        value: index
+    }));
+}
 
 const dashboardTheme = {
     background: '#1a2f4d',
@@ -514,918 +467,996 @@ const dashboardTheme = {
     hover: '#3f6c9d'
 };
 
-// Initialize blessed screen
-screen = blessed.screen({
-    smartCSR: true,
-    title: 'Dashboard',
-    style: {
-        bg: dashboardTheme.background,
-        fg: dashboardTheme.text
-    }
-});
-
-const SIDEBAR_WIDTH_RATIO = 0.2;
-const DESCRIPTION_FOOTER_HEIGHT = 3;
-
-const sidebar = blessed.box({
-    top: 0,
-    left: 0,
-    width: currentSettings.sidebarMinWidth ?? defaultSettings.sidebarMinWidth,
-    height: '100%-3',
-    label: 'Scripts',
-    border: 'line',
-    style: {
-        bg: dashboardTheme.panel,
-        fg: dashboardTheme.text,
-        border: { fg: dashboardTheme.border }
-    }
-});
-const rightContainer = blessed.box({
-    top: 0,
-    left: currentSettings.sidebarMinWidth ?? defaultSettings.sidebarMinWidth,
-    width: '100%',
-    height: '100%-3',
-    style: {
-        bg: dashboardTheme.panelAlt,
-        fg: dashboardTheme.text
-    }
-});
-const descriptionFooter = blessed.box({
-    top: '100%-3',
-    left: 0,
-    width: '100%',
-    height: DESCRIPTION_FOOTER_HEIGHT,
-    label: ' Description ',
-    border: 'line',
-    style: {
-        bg: dashboardTheme.panel,
-        fg: dashboardTheme.text,
-        border: { fg: dashboardTheme.border }
-    }
-});
-
-const logsContainer = blessed.box({
-    parent: rightContainer,
-    top: 0,
-    height: '60%',
-    width: '100%',
-    label: 'Logs',
-    border: 'line',
-    style: {
-        bg: dashboardTheme.panelAlt,
-        fg: dashboardTheme.text,
-        border: { fg: dashboardTheme.border }
-    }
-});
-
-const bottomContainer = blessed.box({
-    parent: rightContainer,
-    top: '60%',
-    height: '40%',
-    width: '100%',
-    style: {
-        bg: dashboardTheme.panelAlt,
-        fg: dashboardTheme.text
-    }
-});
-
-const buttonBar = blessed.box({
-    parent: bottomContainer,
-    top: 0,
-    height: 3,
-    width: '100%',
-    style: {
-        bg: dashboardTheme.panel,
-        fg: dashboardTheme.text
-    }
-});
-
-const STOP_BUTTON_WIDTH = 12;
-const controlsContainer = blessed.box({
-    parent: buttonBar,
-    top: 0,
-    left: STOP_BUTTON_WIDTH + 3,
-    right: 1,
-    height: 3
-});
-
-const stopButton = blessed.button({
-    parent: buttonBar,
-    left: 1,
-    mouse: true,
-    keys: true,
-    shrink: false,
-    width: STOP_BUTTON_WIDTH,
-    padding: { left: 1, right: 1 },
-    content: 'Stop',
-    border: 'line',
-    style: {
-        bg: dashboardTheme.panel,
-        fg: dashboardTheme.text,
-        border: { fg: dashboardTheme.border },
-        focus: {
-            bg: dashboardTheme.focus,
-            fg: 'black',
-            bold: true
-        }
-    }
-});
-
-const inputBox = blessed.textbox({
-    parent: controlsContainer,
-    left: 0,
-    width: '50%-1',
-    height: 3,
-    inputOnFocus: true,
-    border: 'line',
-    label: ' Custom Command ',
-    style: {
-        bg: dashboardTheme.panel,
-        fg: dashboardTheme.text,
-        border: { fg: dashboardTheme.border },
-        focus: {
-            border: { fg: dashboardTheme.focus }
-        }
-    }
-});
-
-const filterBox = blessed.textbox({
-    parent: controlsContainer,
-    left: '50%+1',
-    right: 0,
-    height: 3,
-    inputOnFocus: true,
-    border: 'line',
-    label: ' Output Filter ',
-    style: {
-        bg: dashboardTheme.panel,
-        fg: dashboardTheme.text,
-        border: { fg: dashboardTheme.border },
-        focus: {
-            border: { fg: dashboardTheme.focus }
-        }
-    }
-});
-
-const output = blessed.log({
-    parent: bottomContainer,
-    top: 3,
-    height: '100%-3',
-    width: '100%-3',
-    label: 'Process output',
-    border: 'line',
-    scrollable: true,
-    alwaysScroll: true,
-    scrollbar: {
-        ch: ' ',
-        track: { bg: 'grey' },
-        style: { inverse: true }
-    },
-    style: {
-        bg: dashboardTheme.panel,
-        fg: dashboardTheme.text,
-        border: { fg: dashboardTheme.border },
-        focus: {
-            border: { fg: dashboardTheme.focus }
-        }
-    }
-});
-
-const outputHistory = [];
-const outputHistoryLimit = currentSettings.maxQueuedLogLines ?? defaultSettings.maxQueuedLogLines;
-let outputFilterValue = '';
-const OUTPUT_TRIM_MESSAGE = '... [log cleared to prevent memory overflow] ...';
-
-function storeOutputLine(line, writeToFile = true) {
-    outputHistory.push(line);
-    while (outputHistory.length > outputHistoryLimit) {
-        outputHistory.shift();
-    }
-    if (writeToFile && logStream) {
-        logStream.write(`[${new Date().toISOString()}] ${line}\n`);
-    }
-}
-
-function refreshOutputDisplay() {
-    const filter = outputFilterValue;
-    const filtered = filter
-        ? outputHistory.filter(line => line.includes(filter))
-        : outputHistory.slice();
-
-    const maxLines = currentSettings.maxLogLines ?? defaultSettings.maxLogLines;
-    let linesToShow;
-    if (!filter && filtered.length > maxLines) {
-        linesToShow = filtered.slice(filtered.length - maxLines);
-        if (linesToShow.length > 0) {
-            linesToShow[0] = OUTPUT_TRIM_MESSAGE;
-        }
-    } else if (filtered.length > maxLines) {
-        linesToShow = filtered.slice(filtered.length - maxLines);
-    } else {
-        linesToShow = filtered;
-    }
-
-    output.setContent(linesToShow.join('\n'));
-    if (typeof output.scrollTo === 'function') {
-        output.scrollTo(linesToShow.length);
-    }
-    scheduleRender();
-}
-
-function appendOutputLines(message) {
-    const normalized = String(message ?? '').replace(/\r/g, '');
-    if (normalized === '') {
-        storeOutputLine('');
-    } else {
-        const parts = normalized.split('\n');
-        const hasTrailingNewline = normalized.endsWith('\n');
-        for (let i = 0; i < parts.length; i++) {
-            if (i === parts.length - 1 && parts[i] === '' && !hasTrailingNewline) {
-                continue;
-            }
-            storeOutputLine(parts[i]);
-        }
-    }
-    refreshOutputDisplay();
-}
-
-function setOutputFilter(value) {
-    const next = value ?? '';
-    if (next === outputFilterValue) {
-        refreshOutputDisplay();
-        return;
-    }
-    outputFilterValue = next;
-    refreshOutputDisplay();
-}
-
-output.log = (msg) => {
-    appendOutputLines(msg);
-};
-
-initLogFile();
-
-const list = blessed.list({
-    parent: sidebar,
-    width: '100%-3',
-    height: '100%-3',
-    top: 1,
-    left: 1,
-    keys: true,
-    mouse: true,
-    tags: true,
-    items: scripts,
-    style: {
-        bg: dashboardTheme.panel,
-        fg: dashboardTheme.text,
-        border: { fg: dashboardTheme.border },
-        selected: { bg: dashboardTheme.selected, fg: dashboardTheme.text },
-        item: { hover: { bg: dashboardTheme.hover, fg: dashboardTheme.text } }
-    }
-});
-
-list.key(['C-right'], () => {
-    switchCommandSet(1);
-});
-
-list.key(['C-left'], () => {
-    switchCommandSet(-1);
-});
-
-screen.append(sidebar);
-screen.append(rightContainer);
-screen.append(descriptionFooter);
-
-function updateDescriptionFooter(index) {
-    const entry = sidebarEntries[index ?? list.selected];
-    const text = entry && entry.selectable ? (entry.description ?? '') : '';
-    descriptionFooter.setContent(text);
-    scheduleRender();
-}
-
-list.on('select item', (_, index) => {
-    updateDescriptionFooter(index);
-});
-updateDescriptionFooter(list.selected ?? 0);
-
-function applyControlsLayout() {
-    if (currentSettings.showCustomCommand === false) {
-        inputBox.hide();
-        filterBox.left = 0;
-        filterBox.width = '100%';
-        filterBox.right = undefined;
-    } else {
-        inputBox.show();
-        inputBox.left = 0;
-        inputBox.width = '50%-1';
-        filterBox.left = '50%+1';
-        filterBox.width = undefined;
-        filterBox.right = 0;
-    }
-    scheduleRender();
-}
-
-function applyRightLayout() {
-    if (currentSettings.showLogWindow === false) {
-        logsContainer.hide();
-        bottomContainer.top = 0;
-        bottomContainer.height = '100%';
-    } else {
-        logsContainer.show();
-        logsContainer.top = 0;
-        logsContainer.height = '60%';
-        bottomContainer.top = '60%';
-        bottomContainer.height = '40%';
-    }
-    scheduleRender();
-}
-
-function applySidebarLayout() {
-    const minWidth = currentSettings.sidebarMinWidth ?? defaultSettings.sidebarMinWidth;
-    const ratioWidth = Math.floor(screen.width * SIDEBAR_WIDTH_RATIO);
-    const computedWidth = Math.min(screen.width, Math.max(minWidth, ratioWidth));
-    sidebar.width = computedWidth;
-    rightContainer.left = computedWidth;
-    rightContainer.width = Math.max(screen.width - computedWidth, 0);
-    scheduleRender();
-}
-
-applySidebarLayout();
-applyControlsLayout();
-applyRightLayout();
-screen.on('resize', applySidebarLayout);
-
-const logBoxes = [];
-const logWatchers = [];
-(config.logs ?? []).forEach((cfgPath, idx) => {
-    const width = Math.floor(100 / ((config.logs ?? []).length || 1));
-    const resolved = resolveLatest(cfgPath);
-    const box = blessed.log({
-        parent: logsContainer,
-        label: path.basename(resolved),
-        left: `${idx * width}%`,
-        width: `${width}%-2`,
-        height: '100%-3',
-        top: 1,
-        border: 'line',
-        scrollable: true,
-        alwaysScroll: true,
-        scrollbar: {
-            ch: ' ',
-            track: { bg: 'grey' },
-            style: { inverse: true }
-        },
-        style: {
-            bg: dashboardTheme.panel,
-            fg: dashboardTheme.text,
-            border: { fg: dashboardTheme.border },
-            focus: {
-                border: { fg: dashboardTheme.focus }
-            }
-        }
-    });
-    logBoxes.push(box);
+function setOutputLabel(outputPanel, label) {
     try {
-        const tail = startTail(resolved, box);
-        logWatchers.push({ configPath: cfgPath, currentPath: resolved, box, tail });
-    } catch (err) {
-        box.log(`Cannot watch ${resolved}: ${err.message}`);
-    }
-});
+        outputPanel.title = ` ${label} `;
+    } catch { /* ignore */ }
+    requestRenderNow();
+}
 
-setInterval(() => {
-    logWatchers.forEach(w => {
-        if (!w.configPath.includes('{{latest}}')) return;
-        const newPath = resolveLatest(w.configPath);
-        if (newPath === w.currentPath) return;
-        try {
-            w.tail.unwatch();
-        } catch { /* ignore */ }
-        w.box.setLabel(path.basename(newPath));
-        w.tail = startTail(newPath, w.box);
-        w.currentPath = newPath;
-        scheduleRender();
+// interface LogWatcher { configPath: string; currentPath: string; text: TextRenderable; scroll: ScrollBoxRenderable; tail: Tail }
+function startTail(file, textNode) {
+    if (!fs.existsSync(file)) fs.writeFileSync(file, '');
+    const entry = ensureLogQueue(textNode);
+    entry.pending = [];
+    entry.processing = false;
+    entry.backlogDropped = false;
+    const tail = new Tail(file, {
+        follow: true,
+        useWatchFile: true,
+        fsWatchOptions: { interval: 500 }
     });
-}, 60000);
+    tail.on('line', (line) => {
+        enqueueLogLine(textNode, line);
+    });
+    tail.on('error', (err) => {
+        enqueueLogLine(textNode, `Tail error: ${err.message}`);
+    });
+    return tail;
+}
 
-list.focus();
+async function main() {
+    renderer = await createCliRenderer({
+        exitOnCtrlC: false,
+        backgroundColor: dashboardTheme.background
+    });
 
-const focusables = [
-    list,
-    ...logBoxes,
-    stopButton,
-    ...(currentSettings.showCustomCommand === false ? [] : [inputBox]),
-    filterBox,
-    output
-];
-let focusIndex = 0;
+    // --- Root layout (flex only, no absolute coordinates) ---
+    const app = new BoxRenderable(renderer, {
+        width: '100%',
+        height: '100%',
+        flexDirection: 'column',
+        backgroundColor: dashboardTheme.background
+    });
+    renderer.root.add(app);
 
-screen.key('tab', () => {
-    if (typeof cwdSelectorOpen !== 'undefined' && cwdSelectorOpen) return;
-    focusIndex = (focusIndex + 1) % focusables.length;
-    focusables[focusIndex].focus();
-    screen.render(); // Keep immediate render for UI interactions
-});
+    const mainRow = new BoxRenderable(renderer, {
+        flexGrow: 1,
+        flexBasis: 0,
+        minHeight: 0,
+        flexDirection: 'row',
+        backgroundColor: dashboardTheme.background
+    });
+    app.add(mainRow);
 
-// ---------------------------------------------------------------------------
-// Working directory selector (folder browser modal, see ./dashboard-ext.mjs)
-// Activated per command via `promptCwd: true` in dashboard.json
-// (aliases: `cwdPrompt`, `askCwd`, `cwdRequired`).
-// ---------------------------------------------------------------------------
+    const sidebarWidth = currentSettings.sidebarMinWidth ?? defaultSettings.sidebarMinWidth;
+    const sidebarPanel = new BoxRenderable(renderer, {
+        width: sidebarWidth,
+        flexShrink: 0,
+        flexDirection: 'column',
+        border: true,
+        title: 'Scripts',
+        borderColor: dashboardTheme.border,
+        backgroundColor: dashboardTheme.panel
+    });
+    mainRow.add(sidebarPanel);
 
-let cwdSelectorOpen = false;
+    const sidebarSelect = new SelectRenderable(renderer, {
+        flexGrow: 1,
+        minHeight: 0,
+        options: buildSelectOptions(sidebarEntries),
+        backgroundColor: dashboardTheme.panel,
+        textColor: dashboardTheme.text,
+        selectedBackgroundColor: dashboardTheme.selected,
+        selectedTextColor: dashboardTheme.text,
+        showDescription: false
+    });
+    sidebarPanel.add(sidebarSelect);
 
-async function launchSidebarEntry(entry) {
-    if (!entry || !entry.selectable || entry.script === '') return;
-    if (entry.promptCwd === true && !cwdSelectorOpen) {
-        cwdSelectorOpen = true;
+    const rightCol = new BoxRenderable(renderer, {
+        flexGrow: 1,
+        flexBasis: 0,
+        minWidth: 0,
+        flexDirection: 'column',
+        backgroundColor: dashboardTheme.panelAlt
+    });
+    mainRow.add(rightCol);
+
+    const logsRow = new BoxRenderable(renderer, {
+        flexGrow: 3,
+        flexBasis: 0,
+        minHeight: 0,
+        flexDirection: 'row',
+        gap: 1,
+        backgroundColor: dashboardTheme.panelAlt
+    });
+    rightCol.add(logsRow);
+
+    const bottomCol = new BoxRenderable(renderer, {
+        flexGrow: 2,
+        flexBasis: 0,
+        minHeight: 0,
+        flexDirection: 'column',
+        gap: 1,
+        backgroundColor: dashboardTheme.panelAlt
+    });
+    rightCol.add(bottomCol);
+
+    const controlsRow = new BoxRenderable(renderer, {
+        height: 3,
+        flexShrink: 0,
+        flexDirection: 'row',
+        gap: 1,
+        backgroundColor: dashboardTheme.panel
+    });
+    bottomCol.add(controlsRow);
+
+    const stopBtn = new BoxRenderable(renderer, {
+        width: 12,
+        flexShrink: 0,
+        border: true,
+        backgroundColor: dashboardTheme.panel,
+        borderColor: dashboardTheme.border,
+        flexDirection: 'column',
+        justifyContent: 'center',
+        alignItems: 'center',
+        focusable: true
+    });
+    stopBtn.add(new TextRenderable(renderer, { content: 'Stop', fg: dashboardTheme.text, selectable: false }));
+    controlsRow.add(stopBtn);
+
+    const customWrap = new BoxRenderable(renderer, {
+        flexGrow: 1,
+        flexBasis: 0,
+        minWidth: 0,
+        flexDirection: 'column',
+        border: true,
+        title: ' Custom Command ',
+        borderColor: dashboardTheme.border,
+        backgroundColor: dashboardTheme.panel
+    });
+    controlsRow.add(customWrap);
+    const inputBox = new InputRenderable(renderer, {
+        flexGrow: 1,
+        placeholder: '',
+        backgroundColor: dashboardTheme.panel,
+        textColor: dashboardTheme.text
+    });
+    customWrap.add(inputBox);
+
+    const filterWrap = new BoxRenderable(renderer, {
+        flexGrow: 1,
+        flexBasis: 0,
+        minWidth: 0,
+        flexDirection: 'column',
+        border: true,
+        title: ' Output Filter ',
+        borderColor: dashboardTheme.border,
+        backgroundColor: dashboardTheme.panel
+    });
+    controlsRow.add(filterWrap);
+    const filterBox = new InputRenderable(renderer, {
+        flexGrow: 1,
+        placeholder: '',
+        backgroundColor: dashboardTheme.panel,
+        textColor: dashboardTheme.text
+    });
+    filterWrap.add(filterBox);
+
+    const outputPanel = new BoxRenderable(renderer, {
+        flexGrow: 1,
+        flexBasis: 0,
+        minHeight: 0,
+        flexDirection: 'column',
+        border: true,
+        title: 'Process output',
+        borderColor: dashboardTheme.border,
+        backgroundColor: dashboardTheme.panel
+    });
+    bottomCol.add(outputPanel);
+    const outputScroll = new ScrollBoxRenderable(renderer, {
+        flexGrow: 1,
+        minHeight: 0,
+        stickyScroll: true,
+        stickyStart: 'bottom',
+        backgroundColor: dashboardTheme.panel
+    });
+    outputPanel.add(outputScroll);
+    const outputText = new TextRenderable(renderer, { content: '', fg: dashboardTheme.text });
+    outputScroll.add(outputText);
+
+    const descPanel = new BoxRenderable(renderer, {
+        height: 3,
+        flexShrink: 0,
+        flexDirection: 'column',
+        border: true,
+        title: ' Description ',
+        borderColor: dashboardTheme.border,
+        backgroundColor: dashboardTheme.panel
+    });
+    app.add(descPanel);
+    const descText = new TextRenderable(renderer, { content: '', fg: dashboardTheme.text, selectable: false });
+    descPanel.add(descText);
+
+    // Modal layer: centered flex container, hidden unless a modal is open.
+    // Shown by hiding mainRow/descPanel (visible flags only, flex intact).
+    const modalLayer = new BoxRenderable(renderer, {
+        flexGrow: 1,
+        minHeight: 0,
+        flexDirection: 'column',
+        justifyContent: 'center',
+        alignItems: 'center',
+        backgroundColor: dashboardTheme.background,
+        visible: false
+    });
+    app.add(modalLayer);
+
+    const outputHistory = [];
+    const outputHistoryLimit = currentSettings.maxQueuedLogLines ?? defaultSettings.maxQueuedLogLines;
+    let outputFilterValue = '';
+    const OUTPUT_TRIM_MESSAGE = '... [log cleared to prevent memory overflow] ...';
+
+    function storeOutputLine(line, writeToFile = true) {
+        outputHistory.push(line);
+        while (outputHistory.length > outputHistoryLimit) {
+            outputHistory.shift();
+        }
+        if (writeToFile && logStream) {
+            logStream.write(`[${new Date().toISOString()}] ${line}\n`);
+        }
+    }
+
+    function refreshOutputDisplay() {
+        const filter = outputFilterValue;
+        const filtered = filter
+            ? outputHistory.filter(line => line.includes(filter))
+            : outputHistory.slice();
+
+        const maxLines = currentSettings.maxLogLines ?? defaultSettings.maxLogLines;
+        let linesToShow;
+        if (!filter && filtered.length > maxLines) {
+            linesToShow = filtered.slice(filtered.length - maxLines);
+            if (linesToShow.length > 0) {
+                linesToShow[0] = OUTPUT_TRIM_MESSAGE;
+            }
+        } else if (filtered.length > maxLines) {
+            linesToShow = filtered.slice(filtered.length - maxLines);
+        } else {
+            linesToShow = filtered;
+        }
+
         try {
-            const chosen = await promptForWorkingDirectory(screen, {
-                title: entry.label || entry.script,
-                initialDir: process.cwd(),
-                theme: dashboardTheme,
-                scheduleRender,
-                fallbackFocus: list
-            });
-            if (!chosen) {
-                output.log('[dash] Working directory selection cancelled.');
+            outputText.content = linesToShow.join('\n');
+            outputScroll.scrollTo({ x: 0, y: Number.MAX_SAFE_INTEGER });
+        } catch { /* ignore */ }
+        scheduleRender();
+    }
+
+    function appendOutputLines(message) {
+        const normalized = String(message ?? '').replace(/\r/g, '');
+        if (normalized === '') {
+            storeOutputLine('');
+        } else {
+            const parts = normalized.split('\n');
+            const hasTrailingNewline = normalized.endsWith('\n');
+            for (let i = 0; i < parts.length; i++) {
+                if (i === parts.length - 1 && parts[i] === '' && !hasTrailingNewline) {
+                    continue;
+                }
+                storeOutputLine(parts[i]);
+            }
+        }
+        refreshOutputDisplay();
+    }
+
+    function setOutputFilter(value) {
+        const next = value ?? '';
+        if (next === outputFilterValue) {
+            refreshOutputDisplay();
+            return;
+        }
+        outputFilterValue = next;
+        refreshOutputDisplay();
+    }
+
+    initLogFile();
+
+    function updateDescriptionFooter(index) {
+        const entry = sidebarEntries[index ?? sidebarSelect.getSelectedIndex()];
+        const text = entry && entry.selectable ? (entry.description ?? '') : '';
+        try {
+            descText.content = text;
+        } catch { /* ignore */ }
+        scheduleRender();
+    }
+
+    sidebarSelect.on(SelectRenderableEvents.SELECTION_CHANGED, (index) => {
+        updateDescriptionFooter(index);
+    });
+    updateDescriptionFooter(sidebarSelect.getSelectedIndex() ?? 0);
+
+    function applyControlsLayout() {
+        if (currentSettings.showCustomCommand === false) {
+            customWrap.visible = false;
+        } else {
+            customWrap.visible = true;
+        }
+        scheduleRender();
+    }
+
+    function applyRightLayout() {
+        if (currentSettings.showLogWindow === false) {
+            logsRow.visible = false;
+        } else {
+            logsRow.visible = logsRow.getChildrenCount() > 0;
+        }
+        scheduleRender();
+    }
+
+    // NOTE: no absolute-coordinate sidebar math: the sidebar keeps a fixed
+    // flex width, the right column grows. Yoga handles terminal resizes.
+
+    const logTexts = [];
+    const logScrolls = [];
+    const logWatchers = [];
+    (config.logs ?? []).forEach((cfgPath) => {
+        const resolved = resolveLatest(cfgPath);
+        const logPanel = new BoxRenderable(renderer, {
+            flexGrow: 1,
+            flexBasis: 0,
+            minWidth: 0,
+            flexDirection: 'column',
+            border: true,
+            title: path.basename(resolved),
+            borderColor: dashboardTheme.border,
+            backgroundColor: dashboardTheme.panel
+        });
+        logsRow.add(logPanel);
+        const scroll = new ScrollBoxRenderable(renderer, {
+            flexGrow: 1,
+            minHeight: 0,
+            stickyScroll: true,
+            stickyStart: 'bottom',
+            backgroundColor: dashboardTheme.panel
+        });
+        logPanel.add(scroll);
+        const textNode = new TextRenderable(renderer, { content: '', fg: dashboardTheme.text });
+        scroll.add(textNode);
+        logTexts.push(textNode);
+        logScrolls.push(scroll);
+        try {
+            const tail = startTail(resolved, textNode);
+            logWatchers.push({ configPath: cfgPath, currentPath: resolved, panel: logPanel, text: textNode, scroll, tail });
+        } catch (err) {
+            enqueueLogLine(textNode, `Cannot watch ${resolved}: ${err.message}`);
+        }
+    });
+
+    function refreshCommandSetLabel() {
+        const currentSet = getCurrentCommandSet();
+        const sets = Array.isArray(config.commandSets) ? config.commandSets : [];
+        try {
+            sidebarPanel.title = sets.length > 0 ? ` Scripts (${currentSet.name}) ` : 'Scripts';
+        } catch { /* ignore */ }
+    }
+    refreshCommandSetLabel();
+
+    function switchCommandSet(direction = 1) {
+        const sets = Array.isArray(config.commandSets) ? config.commandSets : [];
+        if (sets.length <= 1) return;
+
+        currentCommandSetIndex += direction;
+
+        if (currentCommandSetIndex < 0) {
+            currentCommandSetIndex = sets.length - 1;
+        } else if (currentCommandSetIndex >= sets.length) {
+            currentCommandSetIndex = 0;
+        }
+
+        sidebarEntries = normalizeSidebarEntriesFromSet(getCurrentCommandSet());
+        try {
+            sidebarSelect.options = buildSelectOptions(sidebarEntries);
+            sidebarSelect.setSelectedIndex(0);
+        } catch { /* ignore */ }
+
+        refreshCommandSetLabel();
+        updateDescriptionFooter(0);
+        requestRenderNow();
+    }
+
+    setInterval(() => {
+        logWatchers.forEach(w => {
+            if (!w.configPath.includes('{{latest}}')) return;
+            const newPath = resolveLatest(w.configPath);
+            if (newPath === w.currentPath) return;
+            try {
+                w.tail.unwatch();
+            } catch { /* ignore */ }
+            try {
+                w.panel.title = path.basename(newPath);
+            } catch { /* ignore */ }
+            w.tail = startTail(newPath, w.text);
+            w.currentPath = newPath;
+            scheduleRender();
+        });
+    }, 60000);
+
+    sidebarSelect.focus();
+
+    const focusables = [
+        sidebarSelect,
+        ...logScrolls,
+        stopBtn,
+        ...(currentSettings.showCustomCommand === false ? [] : [inputBox]),
+        filterBox,
+        outputScroll
+    ];
+    let focusIndex = 0;
+
+    function focusAt(index) {
+        if (focusables.length === 0) return;
+        focusIndex = ((index % focusables.length) + focusables.length) % focusables.length;
+        try {
+            focusables[focusIndex].focus();
+        } catch { /* ignore */ }
+        requestRenderNow();
+    }
+
+    // ---------------------------------------------------------------------------
+    // Working directory selector (folder browser modal, see ./dashboard-ext.mjs)
+    // Activated per command via `promptCwd: true` in dashboard.json
+    // (aliases: `cwdPrompt`, `askCwd`, `cwdRequired`).
+    // ---------------------------------------------------------------------------
+
+    let cwdSelectorOpen = false;
+
+    async function launchSidebarEntry(entry) {
+        if (!entry || !entry.selectable || entry.script === '') return;
+        if (entry.promptCwd === true && !cwdSelectorOpen) {
+            cwdSelectorOpen = true;
+            mainRow.visible = false;
+            descPanel.visible = false;
+            modalLayer.visible = true;
+            requestRenderNow();
+            try {
+                const chosen = await promptForWorkingDirectory(renderer, {
+                    mount: modalLayer,
+                    title: entry.label || entry.script,
+                    initialDir: process.cwd(),
+                    theme: dashboardTheme,
+                    requestRender: scheduleRender
+                });
+                if (!chosen) {
+                    appendOutputLines('[dash] Working directory selection cancelled.');
+                    scheduleRender();
+                    return;
+                }
+                await runScriptFile(entry.script, { cwd: chosen });
+            } finally {
+                modalLayer.visible = false;
+                mainRow.visible = true;
+                descPanel.visible = true;
+                cwdSelectorOpen = false;
+                focusAt(focusIndex);
+            }
+            return;
+        }
+        await runScriptFile(entry.script);
+    }
+
+    const registeredKeys = new Set();
+    for (const entry of sidebarEntries) {
+        if (!entry.selectable || entry.keyName === '' || registeredKeys.has(entry.keyName)) {
+            continue;
+        }
+        registeredKeys.add(entry.keyName);
+    }
+
+    function shutdown(code = 0) {
+        try {
+            for (const w of logWatchers) {
+                try { w.tail.unwatch(); } catch { /* ignore */ }
+            }
+        } catch { /* ignore */ }
+        stopLogFile();
+        if (current) {
+            try { current.kill(); } catch { /* ignore */ }
+        }
+        try {
+            renderer.destroy();
+        } catch { /* ignore */ }
+        const closed = renderer?.closed;
+        if (closed && typeof closed.then === 'function') {
+            closed.then(
+                () => process.exit(code),
+                () => process.exit(code)
+            );
+        } else {
+            process.exit(code);
+        }
+    }
+
+    function stopCurrentProcess() {
+        if (current) {
+            current.kill();
+            current = null;
+            appendOutputLines('Current process killed.');
+            scheduleRender();
+        }
+    }
+
+    renderer.keyInput.on('keypress', (key) => {
+        if (!key) return;
+        if (cwdSelectorOpen) return; // modal handles its own keys (Escape = cancel)
+
+        // Command-set switching: ctrl+left / ctrl+right
+        if (key.ctrl && !key.meta && (key.name === 'left' || key.name === 'right')) {
+            key.preventDefault();
+            switchCommandSet(key.name === 'right' ? 1 : -1);
+            return;
+        }
+
+        // Tab cycles focus (shift+tab goes backward)
+        if (key.name === 'tab' && !key.ctrl && !key.meta) {
+            key.preventDefault();
+            focusAt(focusIndex + (key.shift ? -1 : 1));
+            return;
+        }
+
+        // History navigation inside the custom-command input
+        const focused = renderer.currentFocusedRenderable;
+        if (focused === inputBox && (key.name === 'up' || key.name === 'down') && !key.ctrl && !key.meta) {
+            if (currentSettings.enableCommandHistory !== true) return;
+            if (commandHistory.length === 0) return;
+            key.preventDefault();
+            if (key.name === 'up') {
+                if (historyIndex > 0) historyIndex--;
+                try { inputBox.value = commandHistory[historyIndex] ?? ''; } catch { /* ignore */ }
                 scheduleRender();
+            } else {
+                if (historyIndex < commandHistory.length - 1) {
+                    historyIndex++;
+                    try { inputBox.value = commandHistory[historyIndex] ?? ''; } catch { /* ignore */ }
+                } else {
+                    historyIndex = commandHistory.length;
+                    try { inputBox.value = ''; } catch { /* ignore */ }
+                }
+                scheduleRender();
+            }
+            return;
+        }
+
+        // Enter on the Stop button
+        if (focused === stopBtn && key.name === 'return' && !key.ctrl && !key.meta) {
+            key.preventDefault();
+            stopCurrentProcess();
+            return;
+        }
+
+        // quit: q (when not editing) or ctrl+c
+        if ((key.name === 'q' && !key.ctrl && !key.meta && focused !== inputBox && focused !== filterBox) ||
+            (key.ctrl && !key.meta && key.name === 'c')) {
+            key.preventDefault();
+            shutdown(0);
+            return;
+        }
+
+        // rerun last command: ctrl+r
+        if (key.ctrl && !key.meta && !key.shift && key.name === 'r') {
+            key.preventDefault();
+            if (!lastCommand) {
+                requestRenderNow();
                 return;
             }
-            await runScriptFile(entry.script, { cwd: chosen });
-        } finally {
-            cwdSelectorOpen = false;
+            if (lastCommand.kind === 'script') {
+                runScript(lastCommand.value, { cwd: lastCommand.cwd }).catch(err => {
+                    appendOutputLines(`Error: ${err.message}`);
+                    scheduleRender();
+                });
+            } else {
+                runCustomCommand(lastCommand.value, { cwd: lastCommand.cwd });
+            }
+            return;
         }
-        return;
-    }
-    await runScriptFile(entry.script);
-}
 
-const registeredKeys = new Set();
-for (const entry of sidebarEntries) {
-    if (!entry.selectable || entry.keyName === '' || registeredKeys.has(entry.keyName)) {
-        continue;
-    }
-    registeredKeys.add(entry.keyName);
-    screen.key(entry.keyName, () => {
-        launchSidebarEntry(entry).catch((err) => {
-            output.log(`Error: ${err?.message || err}`);
+        // stop: ctrl+s
+        if (key.ctrl && !key.meta && !key.shift && key.name === 's') {
+            key.preventDefault();
+            stopCurrentProcess();
+            return;
+        }
+
+        // per-entry shortcuts
+        for (const entry of sidebarEntries) {
+            if (!entry.selectable || entry.keyName === '') continue;
+            if (specMatchesKeyEvent(entry.rawKey || '', key)) {
+                key.preventDefault();
+                launchSidebarEntry(entry).catch((err) => {
+                    appendOutputLines(`Error: ${err?.message || err}`);
+                    scheduleRender();
+                });
+                return;
+            }
+        }
+    });
+
+    sidebarSelect.on(SelectRenderableEvents.ITEM_SELECTED, (index) => {
+        const entry = sidebarEntries[index];
+        if (entry?.selectable && entry.script !== '') {
+            launchSidebarEntry(entry).catch((err) => {
+                appendOutputLines(`Error: ${err?.message || err}`);
+                scheduleRender();
+            });
+        }
+    });
+
+    stopBtn.onMouseDown = () => {
+        stopCurrentProcess();
+    };
+
+    inputBox.on(InputRenderableEvents.ENTER, (value) => {
+        const trimmed = (value || '').trim();
+        if (!trimmed) return;
+        commandHistory.push(trimmed);
+        historyIndex = commandHistory.length;
+        runCustomCommand(trimmed);
+        try { inputBox.value = ''; } catch { /* ignore */ }
+        requestRenderNow();
+    });
+
+    filterBox.on(InputRenderableEvents.ENTER, (value) => {
+        setOutputFilter(value ?? '');
+        requestRenderNow();
+    });
+
+    filterBox.on(InputRenderableEvents.CHANGE, (value) => {
+        // Keep the committed filter in sync; Escape restores it via key handler below.
+    });
+
+    renderer.keyInput.on('keypress', (key) => {
+        if (cwdSelectorOpen) return;
+        if (!key || key.name !== 'escape') return;
+        const focused = renderer.currentFocusedRenderable;
+        if (focused === filterBox) {
+            key.preventDefault();
+            try { filterBox.value = outputFilterValue; } catch { /* ignore */ }
+            focusAt(focusIndex + 1);
+        } else if (focused === inputBox) {
+            key.preventDefault();
+            try { inputBox.value = ''; } catch { /* ignore */ }
+            focusAt(focusIndex + 1);
+        }
+    });
+
+    // NOTE: moved here exactly like your original file layout
+    let current = null;
+    const commandHistory = [];
+    let historyIndex = -1;
+
+    function runCustomCommand(command, options = {}) {
+        const trimmed = (command || '').trim();
+        if (!trimmed) return;
+
+        if (current) {
+            current.kill();
+            appendOutputLines('Previous process killed.');
+        }
+
+        const spawnCwd = resolveSpawnCwd(options.cwd);
+        if (spawnCwd) {
+            appendOutputLines(`[dash] cwd: ${spawnCwd}`);
+        }
+
+        const args = trimmed.split(' ');
+        const cmd = args.shift();
+
+        current = spawn(cmd, args, { shell: true, ...(spawnCwd ? { cwd: spawnCwd } : {}) });
+        setOutputLabel(outputPanel, trimmed);
+        lastCommand = { kind: 'custom', value: trimmed, cwd: spawnCwd };
+
+        current.stdout.on('data', data => {
+            appendOutputLines(data.toString());
             scheduleRender();
         });
-    });
-}
 
-screen.key(['q', 'C-c'], () => {
-    if (cwdSelectorOpen) return; // modal handles its own keys (Escape = cancel)
-    if (current) {
-        current.kill();
-    }
-    screen.render(); // Keep immediate render for exit
-    process.exit(0);
-});
-
-screen.key('C-r', () => {
-    if (cwdSelectorOpen) return;
-    if (!lastCommand) {
-        screen.render(); // Keep immediate render for UI feedback
-        return;
-    }
-
-    if (lastCommand.kind === 'script') {
-        runScript(lastCommand.value, { cwd: lastCommand.cwd }).catch(err => {
-            output.log(`Error: ${err.message}`);
+        current.stderr.on('data', data => {
+            appendOutputLines(data.toString());
             scheduleRender();
         });
-    } else {
-        runCustomCommand(lastCommand.value, { cwd: lastCommand.cwd });
-    }
-});
 
-// Keyboard shortcut to stop the current process
-screen.key('C-s', () => {
-    if (cwdSelectorOpen) return;
-    stopCurrentProcess();
-});
+        current.on('close', code => {
+            appendOutputLines(`Process exited with code ${code}`);
+            current = null;
 
-focusables.forEach(el => {
-    el.key('up', () => { el.scroll(-1); screen.render(); }); // Keep immediate render for scrolling
-    el.key('down', () => { el.scroll(1); screen.render(); }); // Keep immediate render for scrolling
-});
+            if (config.settings?.notifyOnExit) {
+                try { process.stdout.write('\x07'); } catch { /* ignore */ }
+            }
 
-list.on('select', (_, index) => {
-    const entry = sidebarEntries[index];
-    if (entry?.selectable && entry.script !== '') {
-        launchSidebarEntry(entry).catch((err) => {
-            output.log(`Error: ${err?.message || err}`);
             scheduleRender();
         });
     }
-});
 
-stopButton.on('press', () => {
-    stopCurrentProcess();
-});
-
-inputBox.on('submit', (value) => {
-    const trimmed = (value || '').trim();
-    if (!trimmed) return;
-
-    // add to command history
-    commandHistory.push(trimmed);
-    historyIndex = commandHistory.length;
-    runCustomCommand(trimmed);
-    inputBox.clearValue();
-    screen.render(); // Keep immediate render for UI interactions
-});
-
-inputBox.on('keypress', (_, key) => {
-    if (config.settings?.enableCommandHistory !== true) return;
-    if (commandHistory.length === 0) return;
-
-    if (key.name === 'up') {
-        if (historyIndex > 0) historyIndex--;
-        inputBox.setValue(commandHistory[historyIndex] ?? '');
-        inputBox.cursor = inputBox.getValue().length;
-        scheduleRender();
-    }
-
-    if (key.name === 'down') {
-        if (historyIndex < commandHistory.length - 1) {
-            historyIndex++;
-            inputBox.setValue(commandHistory[historyIndex] ?? '');
-        } else {
-            historyIndex = commandHistory.length;
-            inputBox.clearValue();
+    async function closePorts(method, ports) {
+        for (const p of ports) {
+            const port = parseInt(p, 10);
+            if (isNaN(port)) continue;
+            try {
+                await kill(port, method);
+                appendOutputLines(`Closed ${method.toUpperCase()} port ${port}`);
+            } catch (err) {
+                appendOutputLines(`Error closing ${method.toUpperCase()} port ${port}: ${err.message}`);
+            }
+            scheduleRender();
         }
-        inputBox.cursor = inputBox.getValue().length;
-        scheduleRender();
-    }
-});
-
-inputBox.on('cancel', () => {
-    inputBox.clearValue();
-    focusIndex = (focusIndex + 1) % focusables.length;
-    focusables[focusIndex].focus();
-    screen.render(); // Keep immediate render for UI interactions
-});
-
-inputBox.key(['escape'], () => {
-    inputBox.cancel();
-});
-
-filterBox.on('submit', (value) => {
-    setOutputFilter(value ?? '');
-    screen.render(); // Keep immediate render for UI interactions
-});
-
-filterBox.on('keypress', (_, key) => {
-    if (key.name === 'escape') {
-        filterBox.cancel();
-    }
-});
-
-filterBox.on('cancel', () => {
-    filterBox.setValue(outputFilterValue);
-    focusIndex = (focusIndex + 1) % focusables.length;
-    focusables[focusIndex].focus();
-    screen.render(); // Keep immediate render for UI interactions
-});
-
-// NOTE: moved here exactly like your original file layout
-let current = null;
-const commandHistory = [];
-let historyIndex = -1;
-
-function stopCurrentProcess() {
-    if (current) {
-        current.kill();
-        current = null;
-        output.log('Current process killed.');
-        scheduleRender();
-    }
-}
-
-function runCustomCommand(command, options = {}) {
-    const trimmed = (command || '').trim();
-    if (!trimmed) return;
-
-    if (current) {
-        current.kill();
-        output.log('Previous process killed.');
     }
 
-    const spawnCwd = resolveSpawnCwd(options.cwd);
-    if (spawnCwd) {
-        output.log(`[dash] cwd: ${spawnCwd}`);
-    }
-
-    const args = trimmed.split(' ');
-    const cmd = args.shift();
-
-    current = spawn(cmd, args, { shell: true, ...(spawnCwd ? { cwd: spawnCwd } : {}) });
-    setOutputLabel(trimmed);
-    lastCommand = { kind: 'custom', value: trimmed, cwd: spawnCwd };
-
-    current.stdout.on('data', data => {
-        output.log(data.toString());
-        scheduleRender();
-    });
-
-    current.stderr.on('data', data => {
-        output.log(data.toString());
-        scheduleRender();
-    });
-
-    current.on('close', code => {
-        output.log(`Process exited with code ${code}`);
-        current = null;
-
-        if (config.settings?.notifyOnExit) {
-            screen.program.bell();
-        }
-
-        scheduleRender();
-    });
-}
-
-async function closePorts(method, ports) {
-    for (const p of ports) {
-        const port = parseInt(p, 10);
-        if (isNaN(port)) continue;
-        try {
-            await kill(port, method);
-            output.log(`Closed ${method.toUpperCase()} port ${port}`);
-        } catch (err) {
-            output.log(`Error closing ${method.toUpperCase()} port ${port}: ${err.message}`);
-        }
-        scheduleRender();
-    }
-}
-
-function execShell(cmd) {
-    return new Promise((resolve) => {
-        exec(cmd, { windowsHide: true }, (err, stdout, stderr) => {
-            resolve({
-                code: err ? (err.code || 1) : 0,
-                stdout: stdout || '',
-                stderr: stderr || (err ? err.message : '')
+    function execShell(cmd) {
+        return new Promise((resolve) => {
+            exec(cmd, { windowsHide: true }, (err, stdout, stderr) => {
+                resolve({
+                    code: err ? (err.code || 1) : 0,
+                    stdout: stdout || '',
+                    stderr: stderr || (err ? err.message : '')
+                });
             });
         });
-    });
-}
-
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-function isAlive(pid) {
-    try { process.kill(pid, 0); return true; }
-    catch (e) { return e && e.code === 'EPERM' ? true : false; }
-}
-
-async function waitForExit(pid, timeoutMs) {
-    const start = Date.now();
-    while (Date.now() - start < timeoutMs) {
-        if (!isAlive(pid)) return true;
-        await sleep(100);
     }
-    return !isAlive(pid);
-}
 
-// Linux: read /proc/*/cmdline (robust, no ps/pgrep)
-// Windows: tasklist CSV
-function readCmdline(pid) {
-    try {
-        const raw = fs.readFileSync(`/proc/${pid}/cmdline`);
-        // cmdline is \0-separated
-        return raw.toString('utf8').split('\0').filter(Boolean).join(' ');
-    } catch {
-        return '';
+    function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+    function isAlive(pid) {
+        try { process.kill(pid, 0); return true; }
+        catch (e) { return e && e.code === 'EPERM' ? true : false; }
     }
-}
 
-async function getPidsByName(name) {
-    const needle = String(name).toLowerCase();
-    const selfPid = process.pid;
-    const results = new Set();
+    async function waitForExit(pid, timeoutMs) {
+        const start = Date.now();
+        while (Date.now() - start < timeoutMs) {
+            if (!isAlive(pid)) return true;
+            await sleep(100);
+        }
+        return !isAlive(pid);
+    }
 
-    if (process.platform === 'win32') {
-        const { stdout } = await execShell(`tasklist /FO CSV /NH`);
-        stdout.split(/\r?\n/).forEach(line => {
-            if (!line.trim()) return;
-            const parts = line.split('","').map(s => s.replace(/(^"|"$)/g, ''));
-            const procName = (parts[0] || '').toLowerCase();
-            const pid = parseInt(parts[1], 10);
-            if (!isNaN(pid) && pid !== selfPid && procName.includes(needle)) {
-                results.add(pid);
-            }
-        });
+    // Linux: read /proc/*/cmdline (robust, no ps/pgrep)
+    // Windows: tasklist CSV
+    function readCmdline(pid) {
+        try {
+            const raw = fs.readFileSync(`/proc/${pid}/cmdline`);
+            // cmdline is \0-separated
+            return raw.toString('utf8').split('\0').filter(Boolean).join(' ');
+        } catch {
+            return '';
+        }
+    }
+
+    async function getPidsByName(name) {
+        const needle = String(name).toLowerCase();
+        const selfPid = process.pid;
+        const results = new Set();
+
+        if (process.platform === 'win32') {
+            const { stdout } = await execShell(`tasklist /FO CSV /NH`);
+            stdout.split(/\r?\n/).forEach(line => {
+                if (!line.trim()) return;
+                const parts = line.split('","').map(s => s.replace(/(^"|"$)/g, ''));
+                const procName = (parts[0] || '').toLowerCase();
+                const pid = parseInt(parts[1], 10);
+                if (!isNaN(pid) && pid !== selfPid && procName.includes(needle)) {
+                    results.add(pid);
+                }
+            });
+            return Array.from(results);
+        }
+
+        // Linux /proc scan
+        let pids;
+        try {
+            pids = fs.readdirSync('/proc').filter(d => /^\d+$/.test(d));
+        } catch {
+            pids = [];
+        }
+
+        for (const d of pids) {
+            const pid = parseInt(d, 10);
+            if (pid === selfPid) continue;
+            const cmd = readCmdline(pid).toLowerCase();
+            // If cmdline is empty, some daemons: could fall back to exe
+            if (!cmd) continue;
+            if (cmd.includes(needle)) results.add(pid);
+        }
         return Array.from(results);
     }
 
-    // Linux /proc scan
-    let pids;
-    try {
-        pids = fs.readdirSync('/proc').filter(d => /^\d+$/.test(d));
-    } catch {
-        pids = [];
-    }
-
-    for (const d of pids) {
-        const pid = parseInt(d, 10);
-        if (pid === selfPid) continue;
-        const cmd = readCmdline(pid).toLowerCase();
-        // If cmdline is empty, some daemons: could fall back to exe
-        if (!cmd) continue;
-        if (cmd.includes(needle)) results.add(pid);
-    }
-    return Array.from(results);
-}
-
-async function killPid(pid) {
-    // SIGTERM
-    try { process.kill(pid, 'SIGTERM'); } catch (e) {
-        if (e && e.code === 'ESRCH') return { ok: true, method: 'already-dead' };
-        if (e && e.code === 'EPERM') return { ok: false, method: 'SIGTERM', error: 'EPERM' };
-        // other error -> force kill anyway
-    }
-    const graceful = await waitForExit(pid, 1500);
-    if (graceful) return { ok: true, method: 'SIGTERM' };
-
-    // FORCE
-    if (process.platform === 'win32') {
-        const { code, stderr } = await execShell(`taskkill /PID ${pid} /T /F`);
-        return { ok: code === 0, method: 'taskkill', error: code !== 0 ? stderr : undefined };
-    } else {
-        try { process.kill(pid, 'SIGKILL'); }
-        catch (e) {
-            if (e && e.code === 'ESRCH') return { ok: true, method: 'SIGKILL' };
-            if (e && e.code === 'EPERM') return { ok: false, method: 'SIGKILL', error: 'EPERM' };
-            return { ok: false, method: 'SIGKILL', error: e.message || 'unknown' };
+    async function killPid(pid) {
+        // SIGTERM
+        try { process.kill(pid, 'SIGTERM'); } catch (e) {
+            if (e && e.code === 'ESRCH') return { ok: true, method: 'already-dead' };
+            if (e && e.code === 'EPERM') return { ok: false, method: 'SIGTERM', error: 'EPERM' };
+            // other error -> force kill anyway
         }
-        const hard = await waitForExit(pid, 1000);
-        return { ok: hard, method: 'SIGKILL', error: hard ? undefined : 'still alive' };
-    }
-}
+        const graceful = await waitForExit(pid, 1500);
+        if (graceful) return { ok: true, method: 'SIGTERM' };
 
-async function killProcesses(params) {
-    const selfPid = process.pid;
-
-    for (const target of params) {
-        // Direct PID
-        if (/^\d+$/.test(String(target))) {
-            const pid = parseInt(String(target), 10);
-            if (pid === selfPid) { continue; }
-            const res = await killPid(pid);
-            if (res.ok) output.log(`Killed PID ${pid} via ${res.method}`);
-            else output.log(`Failed to kill PID ${pid} via ${res.method}: ${res.error || 'unknown'}`);
-            scheduleRender();
-            continue;
-        }
-
-        // Name / substring pattern (cmdline)
-        const name = String(target).trim();
-        const pids = await getPidsByName(name);
-
-        for (const pid of pids) {
-            if (pid === selfPid) { continue; }
-            const res = await killPid(pid);
-            if (res.ok) output.log(`Killed "${name}" (PID ${pid}) via ${res.method}`);
-            else output.log(`Failed to kill "${name}" (PID ${pid}) via ${res.method}: ${res.error || 'unknown'}`);
-        }
-        scheduleRender();
-    }
-}
-
-
-// Execute a list of actions with shared handlers
-async function executeActions(actions, label = 'actions') {
-    // Normalize and no-op
-    if (!actions || actions.length === 0) return;
-
-    for (const act of actions) {
-        const params = Array.isArray(act.parameters)
-            ? act.parameters
-            : (act.parameters != null ? [act.parameters] : []);
-
-        if (act.action === 'closeTCPPorts') {
-            output.log(`Closing TCP ports ${params}`);
-            await closePorts('tcp', params);
-        } else if (act.action === 'closeUDPPorts') {
-            output.log(`Closing UDP ports ${params}`);
-            await closePorts('udp', params);
-        } else if (act.action === 'killProcess') {
-            output.log(`Killing processes: ${params}`);
-            await killProcesses(params);
+        // FORCE
+        if (process.platform === 'win32') {
+            const { code, stderr } = await execShell(`taskkill /PID ${pid} /T /F`);
+            return { ok: code === 0, method: 'taskkill', error: code !== 0 ? stderr : undefined };
         } else {
-            output.log(`[${label}] unknown action "${act.action}"`);
+            try { process.kill(pid, 'SIGKILL'); }
+            catch (e) {
+                if (e && e.code === 'ESRCH') return { ok: true, method: 'SIGKILL' };
+                if (e && e.code === 'EPERM') return { ok: false, method: 'SIGKILL', error: 'EPERM' };
+                return { ok: false, method: 'SIGKILL', error: e.message || 'unknown' };
+            }
+            const hard = await waitForExit(pid, 1000);
+            return { ok: hard, method: 'SIGKILL', error: hard ? undefined : 'still alive' };
         }
     }
-    scheduleRender();
-}
 
+    async function killProcesses(params) {
+        const selfPid = process.pid;
 
-async function executeBeforeActions(name) {
-    const entries = (config.events?.beforeStartProcess || []).filter(e => e && e.script === name);
-    const actions = entries.flatMap(e => Array.isArray(e.actions) ? e.actions : []);
-    await executeActions(actions, 'pre-launch actions');
-}
-// Execute actions once when the dashboard starts
-async function executeStartupActions() {
-    const actions = config.events?.onDashboardStart;
-    await executeActions(actions, 'startup actions');
-}
-async function runScript(name, options = {}) {
-    if (current) {
-        current.kill();
-        current = null;
+        for (const target of params) {
+            // Direct PID
+            if (/^\d+$/.test(String(target))) {
+                const pid = parseInt(String(target), 10);
+                if (pid === selfPid) { continue; }
+                const res = await killPid(pid);
+                if (res.ok) appendOutputLines(`Killed PID ${pid} via ${res.method}`);
+                else appendOutputLines(`Failed to kill PID ${pid} via ${res.method}: ${res.error || 'unknown'}`);
+                scheduleRender();
+                continue;
+            }
+
+            // Name / substring pattern (cmdline)
+            const name = String(target).trim();
+            const pids = await getPidsByName(name);
+
+            for (const pid of pids) {
+                if (pid === selfPid) { continue; }
+                const res = await killPid(pid);
+                if (res.ok) appendOutputLines(`Killed "${name}" (PID ${pid}) via ${res.method}`);
+                else appendOutputLines(`Failed to kill "${name}" (PID ${pid}) via ${res.method}: ${res.error || 'unknown'}`);
+            }
+            scheduleRender();
+        }
     }
 
-    output.log(`--------------------------------------------------`);
 
-    await executeBeforeActions(name);
-    const spawnCwd = resolveSpawnCwd(options.cwd);
-    if (spawnCwd) {
-        output.log(`[dash] cwd: ${spawnCwd}`);
+    // Execute a list of actions with shared handlers
+    async function executeActions(actions, label = 'actions') {
+        // Normalize and no-op
+        if (!actions || actions.length === 0) return;
+
+        for (const act of actions) {
+            const params = Array.isArray(act.parameters)
+                ? act.parameters
+                : (act.parameters != null ? [act.parameters] : []);
+
+            if (act.action === 'closeTCPPorts') {
+                appendOutputLines(`Closing TCP ports ${params}`);
+                await closePorts('tcp', params);
+            } else if (act.action === 'closeUDPPorts') {
+                appendOutputLines(`Closing UDP ports ${params}`);
+                await closePorts('udp', params);
+            } else if (act.action === 'killProcess') {
+                appendOutputLines(`Killing processes: ${params}`);
+                await killProcesses(params);
+            } else {
+                appendOutputLines(`[${label}] unknown action "${act.action}"`);
+            }
+        }
+        scheduleRender();
     }
-    current = spawn('npm', ['run', name], { shell: true, ...(spawnCwd ? { cwd: spawnCwd } : {}) });
-    lastCommand = { kind: 'script', value: name, cwd: spawnCwd };
 
-    setOutputLabel(name);
 
-    current.stdout.on('data', data => {
-        output.log(data.toString());
-        scheduleRender();
-    });
+    async function executeBeforeActions(name) {
+        const entries = (config.events?.beforeStartProcess || []).filter(e => e && e.script === name);
+        const actions = entries.flatMap(e => Array.isArray(e.actions) ? e.actions : []);
+        await executeActions(actions, 'pre-launch actions');
+    }
+    // Execute actions once when the dashboard starts
+    async function executeStartupActions() {
+        const actions = config.events?.onDashboardStart;
+        await executeActions(actions, 'startup actions');
+    }
+    async function runScript(name, options = {}) {
+        if (current) {
+            current.kill();
+            current = null;
+        }
 
-    current.stderr.on('data', data => {
-        output.log(data.toString());
-        scheduleRender();
-    });
+        appendOutputLines(`--------------------------------------------------`);
 
-    current.on('close', code => {
-        output.log(`Process exited with code ${code}`);
-        current = null;
-        scheduleRender();
-    });
+        await executeBeforeActions(name);
+        const spawnCwd = resolveSpawnCwd(options.cwd);
+        if (spawnCwd) {
+            appendOutputLines(`[dash] cwd: ${spawnCwd}`);
+        }
+        current = spawn('npm', ['run', name], { shell: true, ...(spawnCwd ? { cwd: spawnCwd } : {}) });
+        lastCommand = { kind: 'script', value: name, cwd: spawnCwd };
+
+        setOutputLabel(outputPanel, name);
+
+        current.stdout.on('data', data => {
+            appendOutputLines(data.toString());
+            scheduleRender();
+        });
+
+        current.stderr.on('data', data => {
+            appendOutputLines(data.toString());
+            scheduleRender();
+        });
+
+        current.on('close', code => {
+            appendOutputLines(`Process exited with code ${code}`);
+            current = null;
+            scheduleRender();
+        });
+    }
+
+    async function runScriptFile(scriptFile, options = {}) {
+        if (current) {
+            current.kill();
+            current = null;
+        }
+
+        const scriptPath = path.join(config.scriptsDir ?? './scripts', scriptFile);
+
+        appendOutputLines(`--------------------------------------------------`);
+        appendOutputLines(`[dash] Running: ${scriptPath}`);
+
+        const spawnCwd = resolveSpawnCwd(options.cwd);
+        if (spawnCwd) {
+            appendOutputLines(`[dash] cwd: ${spawnCwd}`);
+        }
+
+        await executeBeforeActions(path.basename(scriptFile, path.extname(scriptFile)));
+
+        const spawnOptions = { shell: true, ...(spawnCwd ? { cwd: spawnCwd } : {}) };
+        // If the script file doesn't exist in scriptsDir, treat it as a shell command
+        if (!fs.existsSync(scriptPath)) {
+            const effectiveCommand = withGnomeTerminalWorkdir(scriptFile, spawnCwd);
+            current = spawn(effectiveCommand, spawnOptions);
+            lastCommand = { kind: 'custom', value: effectiveCommand, cwd: spawnCwd };
+            setOutputLabel(outputPanel, scriptFile);
+        } else {
+            current = spawn(scriptPath, spawnOptions);
+            lastCommand = { kind: 'custom', value: scriptPath, cwd: spawnCwd };
+            setOutputLabel(outputPanel, path.basename(scriptPath));
+        }
+
+        current.stdout.on('data', data => {
+            appendOutputLines(data.toString());
+            scheduleRender();
+        });
+
+        current.stderr.on('data', data => {
+            appendOutputLines(data.toString());
+            scheduleRender();
+        });
+
+        current.on('close', code => {
+            appendOutputLines(`Process exited with code ${code}`);
+            current = null;
+            scheduleRender();
+        });
+    }
+
+    applyControlsLayout();
+    applyRightLayout();
+
+    // Kick off one-shot startup actions
+    (async () => {
+        try {
+            await executeStartupActions();
+        } catch (err) {
+            appendOutputLines(`[startup] error: ${err?.message || err}`);
+            scheduleRender();
+        }
+    })();
+
+    requestRenderNow();
 }
 
-async function runScriptFile(scriptFile, options = {}) {
-    if (current) {
-        current.kill();
-        current = null;
-    }
-
-    const scriptPath = path.join(config.scriptsDir ?? './scripts', scriptFile);
-
-    output.log(`--------------------------------------------------`);
-    output.log(`[dash] Running: ${scriptPath}`);
-
-    const spawnCwd = resolveSpawnCwd(options.cwd);
-    if (spawnCwd) {
-        output.log(`[dash] cwd: ${spawnCwd}`);
-    }
-
-    await executeBeforeActions(path.basename(scriptFile, path.extname(scriptFile)));
-
-    const spawnOptions = { shell: true, ...(spawnCwd ? { cwd: spawnCwd } : {}) };
-    // If the script file doesn't exist in scriptsDir, treat it as a shell command
-    if (!fs.existsSync(scriptPath)) {
-        const effectiveCommand = withGnomeTerminalWorkdir(scriptFile, spawnCwd);
-        current = spawn(effectiveCommand, spawnOptions);
-        lastCommand = { kind: 'custom', value: effectiveCommand, cwd: spawnCwd };
-        setOutputLabel(scriptFile);
-    } else {
-        current = spawn(scriptPath, spawnOptions);
-        lastCommand = { kind: 'custom', value: scriptPath, cwd: spawnCwd };
-        setOutputLabel(path.basename(scriptPath));
-    }
-
-    current.stdout.on('data', data => {
-        output.log(data.toString());
-        scheduleRender();
-    });
-
-    current.stderr.on('data', data => {
-        output.log(data.toString());
-        scheduleRender();
-    });
-
-    current.on('close', code => {
-        output.log(`Process exited with code ${code}`);
-        current = null;
-        scheduleRender();
-    });
-}
-
-// Kick off one-shot startup actions
-(async () => {
+main().catch((err) => {
     try {
-        await executeStartupActions();
-    } catch (err) {
-        output.log(`[startup] error: ${err?.message || err}`);
-        scheduleRender();
-    }
-})();
-
-screen.render();
+        if (renderer) renderer.destroy();
+    } catch { /* ignore */ }
+    // eslint-disable-next-line no-console
+    console.error(`[dashboard] fatal: ${err?.stack || err?.message || err}`);
+    process.exit(1);
+});
 
 export { initLogFile, stopLogFile };

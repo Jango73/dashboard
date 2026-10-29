@@ -1,28 +1,25 @@
 import fs from 'fs';
 import path from 'path';
-import blessed from 'blessed';
 
-// dashboard-ext.mjs: dashboard helpers merged into a single module
-// to keep a single .mjs dependency next to dashboard.mjs.
-// Section 1: key specs (was key-spec.mjs).
-// Section 2: working directory selector (was cwd-selector.mjs).
-// Section 3: danger highlight for destructive sidebar entries.
+// dashboard-ext.mjs: dashboard helpers (OpenTUI edition).
+// Section 1: key specs (dashboard.json "control+b" -> canonical form +
+//   matching against OpenTUI KeyEvent { name, ctrl, meta, shift }).
+// Section 2: working directory selector (OpenTUI renderables, flex only).
+// Section 3: danger highlight (plain-text marker).
 
 // --- Section 1: key specs ---
 // Human-friendly key specs for dashboard.json ("control+b", "shift+a",
-// "alt+c", "function+f1") translated to the key names blessed emits
-// ("C-b", "S-a", "M-c", "f1").
-//
-// Blessed builds key names as C- (ctrl) plus M- (meta/alt) plus S- (shift)
-// plus base (see blessed lib/program.js, lib/keys.js).
+// "alt+c", "function+f1") translated to a canonical "C-M-S-base" form.
+// Matching is done against OpenTUI KeyEvent objects (see
+// keyEventMatchesSpec / specMatchesKeyEvent).
 //
 // "function"/"fn" only makes sense with an F-key ("function+f1" means F1):
 // the Fn key itself sends nothing to the terminal, so it cannot be used
-// as a real modifier. On most keyboards Fn+F1 simply produces F1 (or a
-// media key, depending on Fn-lock): binding "f1" covers the F1 case.
+// as a real modifier.
 
 const BASE_ALIASES = {
-    return: 'enter',
+    return: 'return',
+    enter: 'return',
     esc: 'escape',
     del: 'delete',
     ins: 'insert',
@@ -32,7 +29,7 @@ const BASE_ALIASES = {
     'page-down': 'pagedown'
 };
 
-const KNOWN_BASE = /^(?:[a-z0-9]|space|enter|escape|tab|backspace|delete|insert|home|end|pageup|pagedown|up|down|left|right|clear|f(?:[1-9]|1[0-2]))$/;
+const KNOWN_BASE = /^(?:[a-z0-9]|space|return|escape|tab|backspace|delete|insert|home|end|pageup|pagedown|up|down|left|right|clear|f(?:[1-9]|1[0-2]))$/;
 
 export function normalizeKeySpec(spec) {
     if (typeof spec !== 'string') return '';
@@ -40,12 +37,12 @@ export function normalizeKeySpec(spec) {
     if (raw === '') return '';
 
     // A lone uppercase letter means Shift+letter: terminals send "A"
-    // with shift held, which blessed reports as "S-a".
+    // with shift held.
     if (/^[A-Z]$/.test(raw)) return 'S-' + raw.toLowerCase();
 
     let parts = raw.split('+').map(function (p) { return p.trim().toLowerCase(); }).filter(function (p) { return p !== ''; });
 
-    // Backward compatibility: raw blessed shorthand ("C-b", "M-c", "S-a").
+    // Backward compatibility: raw shorthand ("C-b", "M-c", "S-a").
     if (parts.length === 1) {
         const m = parts[0].match(/^((?:[cms]-)+)(.+)$/);
         if (m) {
@@ -78,17 +75,59 @@ export function normalizeKeySpec(spec) {
     if (fnMarker && !/^f(?:[1-9]|1[0-2])$/.test(base)) return '';
 
     if (!KNOWN_BASE.test(base)) {
-        // Tolerate single punctuation characters blessed may emit.
+        // Tolerate single punctuation characters.
         if (base.length !== 1) return '';
     }
 
-    // Canonical order matches blessed: C-, then M-, then S-, then base.
+    // Canonical order: C-, then M-, then S-, then base.
     return (ctrl ? 'C-' : '') + (meta ? 'M-' : '') + (shift ? 'S-' : '') + base;
 }
 
 export function formatKeyLabel(spec) {
     if (typeof spec !== 'string') return '';
     return spec.split('+').map(function (p) { return p.trim(); }).filter(function (p) { return p !== ''; }).join('+').toUpperCase();
+}
+
+function parseCanonical(normalized) {
+    if (typeof normalized !== 'string' || normalized === '') return null;
+    let rest = normalized;
+    let ctrl = false;
+    let meta = false;
+    let shift = false;
+    for (;;) {
+        if (rest.startsWith('C-')) { ctrl = true; rest = rest.slice(2); continue; }
+        if (rest.startsWith('M-')) { meta = true; rest = rest.slice(2); continue; }
+        if (rest.startsWith('S-')) { shift = true; rest = rest.slice(2); continue; }
+        break;
+    }
+    if (rest === '') return null;
+    return { ctrl, meta, shift, base: rest };
+}
+
+// Match a canonical spec (as returned by normalizeKeySpec) against an
+// OpenTUI KeyEvent ({ name, ctrl, meta, shift }).
+export function keyEventMatchesSpec(normalized, key) {
+    const parsed = parseCanonical(normalized);
+    if (!parsed || !key || typeof key.name !== 'string') return false;
+    const keyName = String(key.name).toLowerCase();
+    const wantBase = String(parsed.base).toLowerCase();
+    if (keyName !== wantBase) {
+        // Shifted letters may arrive as uppercase with shift set.
+        if (!(wantBase.length === 1 && keyName === wantBase && parsed.shift)) return false;
+    }
+    if (!!key.ctrl !== parsed.ctrl) return false;
+    if (!!(key.meta || key.option) !== parsed.meta) return false;
+    // Shift: require exact match, except function keys where terminals
+    // may report shift implicitly.
+    if (!!key.shift !== parsed.shift) return false;
+    return true;
+}
+
+// Convenience: match a raw dashboard.json spec directly.
+export function specMatchesKeyEvent(spec, key) {
+    const normalized = normalizeKeySpec(spec);
+    if (normalized === '') return false;
+    return keyEventMatchesSpec(normalized, key);
 }
 
 // --- Section 2: working directory selector ---
@@ -135,8 +174,17 @@ export function resolveSpawnCwd(cwd) {
     return undefined;
 }
 
-export function promptForWorkingDirectory(screen, { title = '', initialDir = process.cwd(), theme = {}, scheduleRender = null, fallbackFocus = null } = {}) {
+// OpenTUI folder browser. Layout uses flex only (no absolute coordinates):
+// the caller owns a centered `mount` box (visible while the modal is open)
+// and this function builds a dialog inside it.
+//
+// Resolves to the chosen directory, or null when cancelled.
+export function promptForWorkingDirectory(renderer, { mount, title = '', initialDir = process.cwd(), theme = {}, requestRender = null } = {}) {
     return new Promise((resolve) => {
+        if (!renderer || !mount) {
+            resolve(null);
+            return;
+        }
         let currentDir = path.resolve(initialDir || process.cwd());
         try {
             if (!fs.statSync(currentDir).isDirectory()) currentDir = process.cwd();
@@ -144,173 +192,143 @@ export function promptForWorkingDirectory(screen, { title = '', initialDir = pro
             currentDir = process.cwd();
         }
 
-        const previousFocus = screen.focused;
-        const render = typeof scheduleRender === 'function'
-            ? scheduleRender
-            : () => { try { screen.render(); } catch { /* ignore */ } };
+        const render = typeof requestRender === 'function'
+            ? requestRender
+            : () => { try { renderer.requestRender(); } catch { /* ignore */ } };
 
-        const overlay = blessed.box({
-            parent: screen,
-            top: 'center',
-            left: 'center',
-            width: '70%',
-            height: '70%',
-            border: 'line',
-            label: ` Working directory ${title ? '- ' + String(title).slice(0, 40) : ''} `,
-            style: {
-                bg: theme.panel,
-                fg: theme.text,
-                border: { fg: theme.focus }
-            }
-        });
-
-        const pathBox = blessed.box({
-            parent: overlay,
-            top: 1,
-            left: 1,
-            right: 1,
-            height: 3,
-            border: 'line',
-            label: ' Current directory ',
-            tags: true,
-            style: {
-                bg: theme.panelAlt,
-                fg: theme.text,
-                border: { fg: theme.border }
-            }
-        });
-
-        const dirList = blessed.list({
-            parent: overlay,
-            top: 5,
-            left: 1,
-            right: 1,
-            bottom: 2,
-            keys: true,
-            mouse: true,
-            vi: true,
-            style: {
-                bg: theme.panel,
-                fg: theme.text,
-                selected: { bg: theme.selected, fg: theme.text },
-                item: { hover: { bg: theme.hover, fg: theme.text } }
-            }
-        });
-
-        blessed.box({
-            parent: overlay,
-            bottom: 0,
-            left: 1,
-            right: 1,
-            height: 1,
-            content: 'Enter: confirm/enter | Backspace: parent | Escape: cancel',
-            align: 'center',
-            style: { bg: theme.panel, fg: theme.border }
-        });
-
-        let items = [];
         let settled = false;
+        let dialog = null;
+        let dirSelect = null;
+        let pathText = null;
 
-        function cleanup(value) {
+        const cleanup = (value) => {
             if (settled) return;
             settled = true;
             try {
-                overlay.detach();
+                if (keyHandler) renderer.keyInput.off('keypress', keyHandler);
+            } catch { /* ignore */ }
+            try {
+                if (dialog) dialog.destroyRecursively();
             } catch { /* ignore */ }
             render();
-            try {
-                if (previousFocus && typeof previousFocus.focus === 'function') {
-                    previousFocus.focus();
-                } else if (fallbackFocus && typeof fallbackFocus.focus === 'function') {
-                    fallbackFocus.focus();
-                }
-            } catch { /* ignore */ }
-            try {
-                screen.render();
-            } catch { /* ignore */ }
             resolve(value);
-        }
+        };
 
-        function refresh() {
-            pathBox.setContent(` {bold}${currentDir}{/bold}`);
-            const subdirs = listSubdirectories(currentDir);
-            items = [{ kind: 'select', name: '', display: `✔ Select this folder` }];
-            if (path.dirname(currentDir) !== currentDir) {
-                items.push({ kind: 'parent', name: '..', display: '⬆ .. (parent folder)' });
-            }
-            if (subdirs === null) {
-                items.push({ kind: 'info', name: '', display: '(unreadable)' });
-            } else {
-                for (const name of subdirs) {
-                    const prefix = name.startsWith('.') ? '◌ ' : '📁 ';
-                    items.push({ kind: 'dir', name, display: `${prefix}${name}` });
-                }
-            }
-            dirList.setItems(items.map((it) => it.display));
-            dirList.select(0);
+        const refresh = async () => {
             try {
-                screen.render();
-            } catch { /* ignore */ }
-        }
-
-        dirList.on('select', (_, index) => {
-            const item = items[index];
-            if (!item) return;
-            if (item.kind === 'select') {
-                cleanup(currentDir);
-                return;
-            }
-            if (item.kind === 'info') return;
-            if (item.kind === 'parent') {
-                currentDir = path.dirname(currentDir);
-                refresh();
-                return;
-            }
-            if (item.kind === 'dir') {
-                const next = path.join(currentDir, item.name);
-                try {
-                    if (fs.statSync(next).isDirectory()) {
-                        currentDir = next;
-                        refresh();
-                    }
-                } catch {
-                    // stay on current dir if unreadable
+                const { BoxRenderable, TextRenderable, SelectRenderable } = await import('@opentui/core');
+                if (!dialog) {
+                    dialog = new BoxRenderable(renderer, {
+                        width: '70%',
+                        height: '70%',
+                        border: true,
+                        title: ` Working directory ${title ? '- ' + String(title).slice(0, 40) : ''} `,
+                        borderColor: theme.border,
+                        backgroundColor: theme.panel,
+                        flexDirection: 'column',
+                        padding: 1,
+                        gap: 1
+                    });
+                    mount.add(dialog);
+                    pathText = new TextRenderable(renderer, { content: currentDir, fg: theme.text });
+                    dialog.add(pathText);
+                    dirSelect = new SelectRenderable(renderer, {
+                        flexGrow: 1,
+                        options: [],
+                        backgroundColor: theme.panel,
+                        textColor: theme.text,
+                        selectedBackgroundColor: theme.selected,
+                        selectedTextColor: theme.text,
+                        showDescription: false
+                    });
+                    dialog.add(dirSelect);
+                    const hint = new TextRenderable(renderer, {
+                        content: 'Enter: confirm/enter | Backspace: parent | Escape: cancel',
+                        fg: theme.border,
+                        selectable: false
+                    });
+                    dialog.add(hint);
+                    dirSelect.on('itemSelected', (index) => {
+                        const item = items[index];
+                        if (!item) return;
+                        if (item.kind === 'select') {
+                            cleanup(currentDir);
+                            return;
+                        }
+                        if (item.kind === 'info') return;
+                        if (item.kind === 'parent') {
+                            currentDir = path.dirname(currentDir);
+                            refresh();
+                            return;
+                        }
+                        if (item.kind === 'dir') {
+                            const next = path.join(currentDir, item.name);
+                            try {
+                                if (fs.statSync(next).isDirectory()) {
+                                    currentDir = next;
+                                    refresh();
+                                }
+                            } catch {
+                                // stay on current dir if unreadable
+                            }
+                        }
+                    });
+                    dirSelect.focus();
                 }
+                pathText.content = currentDir;
+                const subdirs = listSubdirectories(currentDir);
+                items = [{ kind: 'select', name: '', display: 'Select this folder' }];
+                if (path.dirname(currentDir) !== currentDir) {
+                    items.push({ kind: 'parent', name: '..', display: 'UP .. (parent folder)' });
+                }
+                if (subdirs === null) {
+                    items.push({ kind: 'info', name: '', display: '(unreadable)' });
+                } else {
+                    for (const name of subdirs) {
+                        const prefix = name.startsWith('.') ? '- ' : '+ ';
+                        items.push({ kind: 'dir', name, display: `${prefix}${name}` });
+                    }
+                }
+                dirSelect.options = items.map((it) => ({ name: it.display, description: it.kind }));
+                dirSelect.setSelectedIndex(0);
+                render();
+            } catch {
+                cleanup(null);
             }
-        });
+        };
 
-        dirList.key(['backspace'], () => {
-            const parent = path.dirname(currentDir);
-            if (parent !== currentDir) {
-                currentDir = parent;
-                refresh();
+        let items = [];
+
+        const keyHandler = (key) => {
+            if (settled) return;
+            if (!key) return;
+            if (key.name === 'escape') {
+                key.preventDefault();
+                key.stopPropagation();
+                cleanup(null);
+                return;
             }
-        });
+            if (key.name === 'backspace') {
+                const parent = path.dirname(currentDir);
+                if (parent !== currentDir) {
+                    key.preventDefault();
+                    key.stopPropagation();
+                    currentDir = parent;
+                    refresh();
+                }
+                return;
+            }
+        };
 
-        dirList.key(['escape'], () => {
-            cleanup(null);
-        });
-
-        overlay.key(['escape'], () => {
-            cleanup(null);
-        });
-
+        renderer.keyInput.on('keypress', keyHandler);
         refresh();
-        dirList.focus();
-        try {
-            screen.render();
-        } catch { /* ignore */ }
     });
 }
 
 // --- Section 3: danger highlight ---
-// Sidebar entries flagged with `"danger": true` in dashboard.json render
-// on a red background through blessed tags (the sidebar list enables
-// `tags: true`). Only an explicit `true` counts: any other value keeps
-// the default rendering.
-const DANGER_LABEL_OPEN_TAG = '{red-bg}{white-fg}';
-const DANGER_LABEL_CLOSE_TAG = '{/}';
-
+// Sidebar entries flagged with `"danger": true` render with a plain-text
+// "! " marker. OpenTUI Select options carry no per-option colors, so the
+// marker (not a background) signals destructive entries.
 export function resolveDangerFlag(command) {
     if (typeof command !== 'object' || command === null) return false;
     return command.danger === true;
@@ -318,7 +336,7 @@ export function resolveDangerFlag(command) {
 
 export function formatSidebarLabel(label, isDanger) {
     if (isDanger !== true) return label;
-    return `${DANGER_LABEL_OPEN_TAG}${label}${DANGER_LABEL_CLOSE_TAG}`;
+    return `! ${label}`;
 }
 
 // --- Section 4: script descriptions ---
